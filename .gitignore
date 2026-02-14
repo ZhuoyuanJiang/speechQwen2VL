@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+*.log
+
+# Forks (installed via scripts/setup_forks.sh, not committed)
+forks/
+
+# Training outputs
+outputs/
+checkpoints/
+wandb/
+runs/
+
+# Large files
+*.wav
+*.mp3
+*.flac
+*.pt
+*.bin
+*.safetensors
+
+# HuggingFace cache
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

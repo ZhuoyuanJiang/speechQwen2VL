@@ -1,0 +1,58 @@
+# =============================================================================
+# Speech-Qwen2VL pip dependencies
+# =============================================================================
+# Based on: vlm_Qwen2VL_object_detection_LOCAL/requirements.txt
+# Snapshot date: 2025-12-16 (reference project)
+#
+# IMPORTANT: After installing these, run scripts/setup_forks.sh to install
+# forked transformers and qwen-vl-utils. They MUST be installed LAST.
+# =============================================================================
+
+# --- Core ML (pinned to reference project versions) ---
+torch==2.4.1+cu121
+torchaudio==2.4.1+cu121
+torchvision==0.19.1+cu121
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# --- HuggingFace ecosystem ---
+# NOTE: transformers and qwen-vl-utils are installed from forks via setup_forks.sh
+# These are listed here as comments for reference:
+#   transformers @ git+https://github.com/huggingface/transformers.git@0f9c9088d0260565cd89af2925836ea2f8bfe5f3  (=4.56.0.dev0)
+#   qwen-vl-utils==0.0.11  (installed from fork)
+trl @ git+https://github.com/huggingface/trl.git@215294872e4853de6e90e9c4845ce4bfc1ba096d
+peft==0.17.1
+datasets==4.0.0
+accelerate==1.10.0
+huggingface-hub==0.34.4
+tokenizers==0.21.4
+safetensors==0.6.2
+
+# --- Quantization & efficient training ---
+bitsandbytes==0.47.0
+flash-attn==2.6.3
+
+# --- Audio processing (NEW for speech project) ---
+librosa>=0.10.0
+soundfile>=0.12.0
+
+# --- ASR evaluation (NEW for speech project) ---
+jiwer>=3.0.0
+
+# --- Experiment tracking ---
+wandb==0.21.1
+tensorboard==2.20.0
+
+# --- Visualization & utilities ---
+matplotlib==3.10.5
+numpy==2.1.2
+pandas==2.3.1
+pillow==11.0.0
+einops==0.8.1
+pyyaml==6.0.2
+tqdm==4.67.1
+
+# --- Jupyter ---
+jupyter==1.1.1
+jupyterlab==4.4.6
+ipykernel==6.30.1
+ipywidgets==8.1.7

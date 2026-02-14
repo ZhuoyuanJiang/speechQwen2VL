@@ -1,0 +1,24 @@
+# =============================================================================
+# Speech-Qwen2VL Training Environment
+# =============================================================================
+# Based on: vlm_Qwen2VL_object_detection_LOCAL environment
+# Purpose: Fine-tuning Qwen2-VL-7B for speech understanding (ASR)
+#
+# To create this environment (on Linux server with NVIDIA GPU only):
+#   conda env create -f environment.yml
+#   bash scripts/setup_forks.sh   # install forked transformers & qwen-vl-utils LAST
+# =============================================================================
+
+name: speech_qwen2vl
+channels:
+  - conda-forge
+  - defaults
+  - nvidia
+dependencies:
+  - python=3.10.18
+  - cuda-toolkit=12.1.1
+  # Audio system libraries (conda-forge)
+  - ffmpeg
+  - libsndfile
+  - pip:
+      - -r requirements.txt
