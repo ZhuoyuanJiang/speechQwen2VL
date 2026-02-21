@@ -133,14 +133,119 @@ bash scripts/setup_forks.sh
 
 ---
 
-## 3. What's Next
+## 3. Fork Modification: vision_process.py (Qwen2-VL fork)
+
+**File**: `forks/Qwen2-VL/qwen-vl-utils/src/qwen_vl_utils/vision_process.py`
+**Fork repo**: `ZhuoyuanJiang/Qwen3-VL`, branch `speech-qwen2vl`
+
+### 3.1 Where fork changes live
+
+The `forks/` directory is in `.gitignore` of the main repo — fork changes are NOT tracked by the main repo. Instead, each fork is its own git repository:
+
+- `forks/Qwen2-VL/` → commits push to `github.com/ZhuoyuanJiang/Qwen3-VL` (speech-qwen2vl branch)
+- `forks/transformers/` → commits push to `github.com/ZhuoyuanJiang/transformers` (speech-qwen2vl branch)
+
+To see fork changes, visit the fork repo on GitHub or check `git log` inside the fork directory.
+
+### 3.2 Changes made
+
+Three changes to `vision_process.py`, all following existing patterns in the file:
+
+**1. Added imports and audio constant** (top of file)
+```python
+import soundfile as sf
+
+# Audio constants (Whisper expects 16kHz mono audio)
+AUDIO_SAMPLE_RATE = 16000
+```
+
+**2. Added `fetch_audio()` function** (before `extract_vision_info()`, ~line 487)
+
+Parallel to the existing `fetch_image()` function. Handles three input formats:
+- `bytes`: raw audio bytes from dataset (e.g., `sample['wav']['bytes']`) — decoded with `soundfile.read(BytesIO(...))`
+- `str`: file path to an audio file — decoded with `soundfile.read()`
+- `np.ndarray`: pre-loaded audio array — used directly
+
+All inputs are converted to float32 mono and resampled to 16kHz (Whisper's expected sample rate). `librosa.resample()` is used for resampling, imported lazily (only when resampling is actually needed).
+
+Returns: `(audio_array, sample_rate)` tuple.
+
+**3. Extended `extract_vision_info()`** (~line 539)
+
+Added `"audio"` to the content type detection condition, so audio elements in conversations are extracted alongside images and videos:
+```python
+or "audio" in ele
+or ele.get("type", "text") in ("image", "image_url", "video", "audio")
+```
+
+**4. Extended `process_vision_info()`** (~line 558)
+
+- Added `audio_inputs = []` list alongside existing `image_inputs` and `video_inputs`
+- Added `elif "audio" in vision_info:` branch that calls `fetch_audio()`
+- Added `audio_inputs = None` when empty (same pattern as images/videos)
+- Changed return from 2-tuple to **3-tuple**: `(image_inputs, video_inputs, audio_inputs)`
+- With `return_video_kwargs=True`: returns 4-tuple `(images, videos, audios, video_kwargs)`
+
+---
+
+## 4. Fork Modification: processing_qwen2_vl.py (transformers fork)
+
+**File**: `forks/transformers/src/transformers/models/qwen2_vl/processing_qwen2_vl.py`
+**Fork repo**: `ZhuoyuanJiang/transformers`, branch `speech-qwen2vl`
+
+### 4.1 Changes made
+
+Four changes to `processing_qwen2_vl.py`, all following the existing image/video patterns:
+
+**1. Added imports** (top of file)
+```python
+import math
+from typing import List, Optional, Tuple, Union
+```
+
+**2. Added `self.audio_token` and `self.audio_token_id` to `__init__`** (~line 92)
+
+Same pattern as existing `image_token`/`video_token` setup:
+```python
+self.audio_token = "<|audio_pad|>" if not hasattr(tokenizer, "audio_token") else tokenizer.audio_token
+self.audio_token_id = (
+    tokenizer.audio_token_id
+    if getattr(tokenizer, "audio_token_id", None)
+    else tokenizer.convert_tokens_to_ids(self.audio_token)
+)
+```
+
+**3. Added `audios` parameter and audio processing to `__call__`** (~line 105, 160-176, 203-210)
+
+- New parameter: `audios: Optional[List[Tuple[np.ndarray, int]]]` — list of `(audio_array, sample_rate)` tuples from `fetch_audio()`
+- Audio feature extraction using `WhisperFeatureExtractor` (imported lazily inside the method):
+  - Computes `num_audio_tokens = min(ceil(duration_seconds * 50), 1500)` per audio
+  - Extracts mel spectrograms via `whisper_fe(audio_array, sampling_rate=sr, return_tensors="np")`
+  - Stacks into `audio_features` (numpy array) and `audio_lengths` (list of token counts)
+- Audio token expansion (same `<|placeholder|>` pattern as image/video):
+  - Replaces each single `<|audio_pad|>` with `num_audio_tokens` copies
+
+**4. Extended `BatchFeature` return** (~line 223-225)
+
+Added `**audio_inputs` to the returned `BatchFeature`, so it now contains:
+- `audio_features`: stacked mel spectrograms, shape `(num_audios, 128, 3000)` — 128 mel bins, 3000 time frames (Whisper's fixed output size)
+- `audio_lengths`: list of token counts per audio (used by the model to know how many `<|audio_pad|>` tokens correspond to each audio)
+
+### 4.2 Token count formula
+
+`min(ceil(duration_seconds * 50), 1500)` where:
+- 50 = tokens per second (Whisper produces 1500 tokens for 30 seconds of audio)
+- 1500 = maximum tokens (Whisper's fixed output length)
+- This dynamically sizes the audio representation in the token sequence based on actual audio duration
+
+---
+
+## 5. What's Next
 
 According to the plan, the remaining tasks are:
 
-1. **Modify `vision_process.py`** in the Qwen2-VL fork — add `fetch_audio()`, extend `extract_vision_info()` and `process_vision_info()` for audio
-2. **Modify `processing_qwen2_vl.py`** in the transformers fork — add audio token expansion, `audios` parameter, WhisperFeatureExtractor processing
-3. **Build Notebook 02** — 11 sections covering format_data, chat template, special tokens, processor push to HF, end-to-end testing
-4. **Commit and push** — fork changes to fork repos, notebook + setup_forks.sh fix to main repo
+1. **Build Notebook 02** — 11 sections covering format_data, chat template, special tokens, processor push to HF, end-to-end testing
+2. **Commit and push** — fork changes to fork repos, notebook + setup_forks.sh fix to main repo
 
 ---
 
