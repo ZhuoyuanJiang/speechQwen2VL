@@ -184,7 +184,7 @@ Maps to skeleton cells 22-43. Follows same style as Notebook 01 (markdown header
 ## Part 4: Commit & Push Main Repo
 
 - Commit Notebook 02 + setup_forks.sh fix to main repo
-- Create `Documentation/Session2_Progress_Documentation.md` (at end of session)
+- Create `Documentation/Session2_Progress_20260220.md` (at end of session)
 - Push to GitHub
 
 ---
@@ -197,7 +197,7 @@ Maps to skeleton cells 22-43. Follows same style as Notebook 01 (markdown header
 | `forks/transformers/.../processing_qwen2_vl.py` | Modify (fork) | Add audio token expansion, audios parameter |
 | `scripts/setup_forks.sh` | Fix | Correct pip install path for qwen-vl-utils |
 | `notebooks/02_tokenizer_and_processor.ipynb` | Create | New notebook |
-| `Documentation/Session2_Progress_Documentation.md` | Create | Session record (at end) |
+| `Documentation/Session2_Progress_20260220.md` | Create | Session record (at end) |
 
 ## Key References
 

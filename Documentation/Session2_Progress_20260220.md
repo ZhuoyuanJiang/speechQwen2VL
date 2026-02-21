@@ -240,12 +240,61 @@ Added `**audio_inputs` to the returned `BatchFeature`, so it now contains:
 
 ---
 
-## 5. What's Next
+## 5. Bug Fix: WhisperFeatureExtractor mel bins (from code review)
 
-According to the plan, the remaining tasks are:
+**Problem**: `WhisperFeatureExtractor()` with no arguments defaults to `feature_size=80` (older Whisper models). But whisper-large-v3-turbo uses 128 mel bins. Our processor was producing `(num_audios, 80, 3000)` instead of `(num_audios, 128, 3000)`. This would crash when fed to the Whisper encoder in Session 3.
 
-1. **Build Notebook 02** — 11 sections covering format_data, chat template, special tokens, processor push to HF, end-to-end testing
-2. **Commit and push** — fork changes to fork repos, notebook + setup_forks.sh fix to main repo
+**Fix**: Changed `WhisperFeatureExtractor()` to `WhisperFeatureExtractor(feature_size=128)` in `processing_qwen2_vl.py` line 167.
+
+**How it was caught**: External code review flagged the mismatch between documentation (128 mel bins) and the default constructor behavior (80 mel bins).
+
+---
+
+## 6. Notebook 02: Tokenizer & Processor Modifications
+
+**File**: `notebooks/02_tokenizer_and_processor.ipynb`
+**HuggingFace repo**: `DanJZY/Qwen2-VL-7B-Speech`
+
+Built and tested on Google Colab. 11 sections covering:
+1. Environment setup and HF login
+2. Create HF repository
+3. Load dataset (streaming)
+4. `format_data()` function
+5. Modify chat template (add audio branch)
+6. Add 3 audio special tokens (IDs 151657-151659)
+7. Save & push processor to HF
+8. Load & test processor from HF
+9. Test `fetch_audio` & `process_vision_info`
+10. End-to-end processor test
+11. Cleanup
+
+### 6.1 Issues encountered during Colab testing
+
+- **HF login on Colab IDE**: `google.colab.userdata` times out in IDE extension. Fixed by checking for cached token first (`HfFolder.get_token()`), falling back to interactive `login()`.
+- **HF username mismatch**: GitHub username is `ZhuoyuanJiang`, HF username is `DanJZY`. `create_repo` failed with 403 until REPO_ID was corrected.
+- **Chat template format**: The actual Jinja2 template format differs from HF documentation examples. The assert caught this. Fixed by using `{% elif 'text' in content %}` as the stable insertion point.
+- **Pip caching git installs**: After fixing the mel bins bug in the fork and pushing to GitHub, restarting the Colab runtime and re-running `pip install` still used the old code. Pip caches packages installed from git URLs and won't re-download on restart. Fixed by adding `--force-reinstall --no-deps` to fork install lines.
+- **Reproducibility**: Pinned fork install lines to exact commit hashes instead of branch names (`@e6f7d83ef...` and `@56b0756a7...`), so the notebook stays locked to the code it was tested against even if we push more commits to `speech-qwen2vl` in later sessions.
+
+### 6.2 Final verified outputs (Colab)
+
+- `audio_features` shape: `(1, 128, 3000)` — 128 mel bins confirmed after fix
+- Token expansion: 856 tokens for 17.12s audio (`ceil(17.12 * 50) = 856`), assertion passed
+- All 11 sections executed without errors
+
+---
+
+## 7. Session 2 Complete
+
+All tasks from the plan are done:
+1. Forked repos and created `speech-qwen2vl` branches
+2. Modified `vision_process.py` (Qwen2-VL fork) — `fetch_audio`, `process_vision_info`
+3. Modified `processing_qwen2_vl.py` (transformers fork) — audio token expansion, mel spectrogram extraction
+4. Fixed `WhisperFeatureExtractor` mel bins bug (80 → 128)
+5. Built and tested Notebook 02 on Google Colab — all cells pass
+6. Committed and pushed all changes (forks + main repo)
+
+**Next**: Session 3 — Model Architecture (add Whisper encoder + audio projector to Qwen2-VL)
 
 ---
 
