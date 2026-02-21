@@ -42,12 +42,13 @@ Includes `to_whisper_config()` method that converts to a `WhisperConfig` object 
 
 Three changes to the top-level config class:
 
-**1. Added `audio_config` to `sub_configs` dict:**
+**1. `sub_configs` dict — audio_config intentionally NOT listed:**
 ```python
 sub_configs = {
     "vision_config": Qwen2VLVisionConfig,
     "text_config": Qwen2VLTextConfig,
-    "audio_config": Qwen2VLAudioConfig,    # NEW
+    # audio_config NOT here — it can be None, and the framework's
+    # to_diff_dict() crashes on None sub_configs (see Q10)
 }
 ```
 
@@ -70,12 +71,12 @@ def __init__(
 **3. Added deserialization for `audio_config`:**
 ```python
 if isinstance(audio_config, dict):
-    self.audio_config = self.sub_configs["audio_config"](**audio_config)
+    self.audio_config = Qwen2VLAudioConfig(**audio_config)
 else:
     self.audio_config = audio_config
 ```
 
-When loading from JSON, `audio_config` arrives as a dict and needs to be converted to a `Qwen2VLAudioConfig` object. When `None` (old configs), it stays `None`. This follows the same pattern as `vision_config` and `text_config` deserialization above it.
+When loading from JSON, `audio_config` arrives as a dict and needs to be converted to a `Qwen2VLAudioConfig` object. When `None` (old configs), it stays `None`. Note: uses `Qwen2VLAudioConfig` directly (not `self.sub_configs`) because audio_config is not in `sub_configs` (see Q10).
 
 ### 1.3 Updated `__all__`
 
@@ -300,9 +301,38 @@ visual_keys = ["pixel_values", "image_grid_thw", "pixel_values_videos", "video_g
 
 ---
 
-## 3. Documentation: session3_QA.md Updates
+## 3. Notebook 03: Model Architecture (Part 3)
 
-Nine Q&A entries total — Q1-Q3 written during plan review, Q4-Q9 added during implementation:
+**File**: `notebooks/03_model_architecture.ipynb`
+
+8-section notebook that initializes the audio-capable model, loads weights, verifies forward pass, and pushes to HuggingFace. Tested on Colab Pro (L4 GPU). Also compatible with server (A6000).
+
+### Sections
+
+1. **Environment Setup** — install dependencies, pin `tokenizers>=0.21,<0.22`, install forks from pinned commit hashes (`934129b77...` for transformers, `56b0756a7...` for Qwen3-VL)
+2. **Load & Modify Config** — `AutoConfig.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")`, add `Qwen2VLAudioConfig()`, set `audio_token_id=151658`. Includes config round-trip test (save → reload → verify `Qwen2VLAudioConfig` deserializes correctly)
+3. **Create Model & Load Base Weights** — `Qwen2VLForConditionalGeneration.from_pretrained()` with modified config + `strict=False`. Audio components init random; everything else loads from pretrained
+4. **Load Whisper Encoder Weights** — `WhisperForConditionalGeneration` in float32 → copy encoder state_dict to `model.model.audio_encoder` with `strict=True` → delete Whisper to free memory
+5. **Verify Model Structure** — parameter count per component, weight initialization status check
+6. **Test Forward Pass** — load processor from `DanJZY/Qwen2-VL-7B-Speech`, load a real audio sample from `speechbrain/LargeScaleASR`, run through processor pipeline → model forward → assert logits shape correct, no NaN/Inf
+7. **Save & Push to HuggingFace** — save locally, verify save/load round-trip (audio weights survive), upload to `DanJZY/Qwen2-VL-7B-Speech`
+8. **Cleanup** — free GPU memory
+
+### Bug fixes during testing
+
+Three issues caught during Colab testing:
+
+1. **`HfFolder` removed** — `huggingface_hub` dropped `HfFolder` class. Fix: `HfFolder` → `get_token` (the modern replacement)
+2. **`total_mem` attribute** — correct attribute is `total_memory`. Fix: `torch.cuda.get_device_properties(0).total_memory`
+3. **`AutoModelForCausalLM` doesn't recognize `Qwen2VLConfig`** — Qwen2-VL is a vision-language model, not a causal LM. Fix: use `Qwen2VLForConditionalGeneration` directly
+4. **`tokenizers` version conflict** — Colab has `tokenizers==0.22.2` but our fork requires `>=0.21,<0.22`. Fix: pin `tokenizers` version in install cell
+5. **`audio_config` in `sub_configs` crashes `to_diff_dict()`** — framework assumes sub-configs are always non-None, but `audio_config` defaults to `None`. Fix: remove from `sub_configs`, handle deserialization manually (see Q10). Required a new fork commit (`5247d6d23`)
+
+---
+
+## 4. Documentation: session3_QA.md Updates
+
+Ten Q&A entries total — Q1-Q3 written during plan review, Q4-Q10 added during implementation:
 
 - **Q1**: Why `audio_features` must be cleared after prefill in generation — encoder re-run waste
 - **Q2**: dtype/device casting for audio encoder input — float32 CPU → bf16 GPU, `int(length.item())`
@@ -313,12 +343,44 @@ Nine Q&A entries total — Q1-Q3 written during plan review, Q4-Q9 added during 
 - **Q7** (user-contributed): How `masked_scatter` finds audio placeholder tokens — two-path mask creation, `unsqueeze`/`expand_as`, `torch.cat` before scatter
 - **Q8** (user-contributed): What `masked_scatter` is and how it works — sequential consumption of source tensor
 - **Q9** (user-contributed): What `_checkpoint_conversion_mapping` is and why we updated it — regex negative lookahead for audio weights
+- **Q10**: Why `audio_config` can't be in `sub_configs` — framework's `to_diff_dict()` assumes non-None
+
+### Cross-session lessons
+
+- **`Documentation/Lessons/general_QA.md`** (Created) — Q1: Fork repos vs vendoring code, why commits are spread across 3 repos, mitigation via documentation
 
 ---
 
-## 4. Session 3 Status (Parts 1-2 Complete)
+## 5. Fork Commits
 
-### Completed
+### Transformers fork (`ZhuoyuanJiang/transformers`, branch `speech-qwen2vl`)
+
+| Commit | Files Changed | Description |
+|--------|---------------|-------------|
+| `9f9d625f5` | `configuration_qwen2_vl.py`, `modeling_qwen2_vl.py` | Add `Qwen2VLAudioConfig`, WhisperEncoder + MLP projector, audio merge in forward(), checkpoint regex fix, generation support (Parts 1+2) |
+| `5247d6d23` | `configuration_qwen2_vl.py` | Remove `audio_config` from `sub_configs` to fix `to_diff_dict()` crash on None (Q10) |
+| `934129b77` | `modeling_qwen2_vl.py` | Add explicit guard for missing `audio_encoder`/`audio_projector` in forward() — reviewer feedback |
+
+### Qwen2-VL fork (`ZhuoyuanJiang/Qwen3-VL`, branch `speech-qwen2vl`)
+
+No changes in Session 3. HEAD remains at `56b0756a7` (from Session 2).
+
+### All fork commits across sessions
+
+| Session | Fork | Commit | Summary |
+|---------|------|--------|---------|
+| 2 | transformers | `42427c074` | Add audio support to Qwen2VLProcessor |
+| 2 | transformers | `e6f7d83ef` | Fix WhisperFeatureExtractor to use 128 mel bins |
+| 2 | Qwen3-VL | `56b0756a7` | Add fetch_audio and extend process_vision_info |
+| 3 | transformers | `9f9d625f5` | Add audio encoder and projector to Qwen2-VL model |
+| 3 | transformers | `5247d6d23` | Fix audio_config sub_configs crash |
+| 3 | transformers | `934129b77` | Add guard for missing audio modules in forward |
+
+---
+
+## 6. Session 3 Status — Complete
+
+### All steps done
 
 | Step | Description | Status |
 |------|-------------|--------|
@@ -334,19 +396,18 @@ Nine Q&A entries total — Q1-Q3 written during plan review, Q4-Q9 added during 
 | Part 2.7 | `Qwen2VLForConditionalGeneration.forward()` passthrough | Done |
 | Part 2.8 | `prepare_inputs_for_generation()` — params + prefill clearing | Done |
 | Part 2.9 | `_expand_inputs_for_generation()` — TODO comment | Done |
+| Part 3 | Notebook 03 — tested on Colab Pro (L4) | Done |
+| Part 4 | Commit fork changes + push | Done |
 
-### Remaining (not started yet)
-
-| Step | Description |
-|------|-------------|
-| Part 3 | Build Notebook 03 (model init, weight loading, forward pass test, push to HF) |
-| Part 4 | Commit fork changes + notebook + docs, push to GitHub |
-
-### Files Modified
+### Files Modified / Created
 
 | File | Action | Description |
 |------|--------|-------------|
 | `forks/transformers/.../configuration_qwen2_vl.py` | Modified | Added `Qwen2VLAudioConfig`, extended `Qwen2VLConfig` |
 | `forks/transformers/.../modeling_qwen2_vl.py` | Modified | Added audio_encoder, audio_projector, forward() merge, generation support |
-| `Documentation/Lessons/session3_QA.md` | Modified | Added Q4, Q5, Q7 |
+| `notebooks/03_model_architecture.ipynb` | Created | Model init, weight loading, forward pass test, push to HF |
+| `Documentation/Lessons/session3_QA.md` | Modified | Added Q4, Q5, Q10 |
+| `Documentation/Lessons/general_QA.md` | Created | Cross-session Q&A (fork vs vendor) |
 | `Documentation/Session3_Progress_20260221.md` | Created | This file |
+
+### Remaining: commit docs + notebook to main repo, push to GitHub

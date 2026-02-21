@@ -118,7 +118,7 @@ Includes `to_whisper_config()` method to convert to `WhisperConfig` for the `Whi
 
 ### 1.2 Modify `Qwen2VLConfig` class
 
-- Add `"audio_config": Qwen2VLAudioConfig` to `sub_configs`
+- ~~Add `"audio_config": Qwen2VLAudioConfig` to `sub_configs`~~ **Revised during implementation**: audio_config must NOT be in `sub_configs` because it can be `None`, and the framework's `to_diff_dict()` crashes on None sub-configs. Deserialization is handled manually in `__init__` instead. See session3_QA.md Q10.
 - Add `audio_config=None` and `audio_token_id=None` parameters to `__init__`
 - Handle deserialization: dict → `Qwen2VLAudioConfig`, None stays None (backward compat)
 - Update `__all__` to include `Qwen2VLAudioConfig`

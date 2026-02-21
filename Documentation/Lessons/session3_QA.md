@@ -459,3 +459,59 @@ r"^model(?!\.(language_model|visual|audio_encoder|audio_projector))"
 ```
 
 **Lesson**: When adding new top-level submodules to a HuggingFace model (under `self.model.*`), always update `_checkpoint_conversion_mapping` to exclude them from the catch-all LLM renaming rule. Otherwise, checkpoint loading will silently rename your new module's weights into the wrong path.
+
+## Q10: Why can't `audio_config` be in `sub_configs`?
+
+**Context**: In `Qwen2VLConfig`, the `sub_configs` class variable tells the transformers framework which keys are nested config objects:
+
+```python
+sub_configs = {
+    "vision_config": Qwen2VLVisionConfig,
+    "text_config": Qwen2VLTextConfig,
+}
+```
+
+We initially added `"audio_config": Qwen2VLAudioConfig` here too. This caused a crash on `AutoConfig.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")`.
+
+**Root cause**: The framework's `to_diff_dict()` (called during config logging/serialization) assumes every entry in `sub_configs` is **always instantiated** — never `None`. It calls `recursive_diff_dict(value, ...)` which does `value.items()`. When `value` is `None`, this crashes with `AttributeError: 'NoneType' object has no attribute 'items'`.
+
+**Why vision/text don't have this problem**: They are always instantiated in `__init__` — when `None` is passed, a default instance is created:
+
+```python
+# vision_config: None → creates default instance (never stays None)
+elif vision_config is None:
+    self.vision_config = self.sub_configs["vision_config"]()
+
+# text_config: same pattern
+elif text_config is None:
+    self.text_config = self.sub_configs["text_config"](**kwargs)
+```
+
+**Why audio_config is different**: Audio is opt-in for backward compatibility — when `None` is passed, it stays `None`:
+
+```python
+# audio_config: None → STAYS None (opt-in, not required)
+else:
+    self.audio_config = audio_config  # can be None
+```
+
+We can't auto-instantiate a default `Qwen2VLAudioConfig()` because that would cause every Qwen2-VL config to include audio components, breaking backward compatibility (see Q4).
+
+**Fix**: Remove `audio_config` from `sub_configs` and handle dict→`Qwen2VLAudioConfig` deserialization manually in `__init__`:
+
+```python
+# sub_configs only lists always-present configs
+sub_configs = {
+    "vision_config": Qwen2VLVisionConfig,
+    "text_config": Qwen2VLTextConfig,
+    # audio_config NOT here — it can be None
+}
+
+# Manual deserialization in __init__
+if isinstance(audio_config, dict):
+    self.audio_config = Qwen2VLAudioConfig(**audio_config)
+else:
+    self.audio_config = audio_config  # None stays None
+```
+
+**Lesson**: The `sub_configs` mechanism in HuggingFace transformers assumes all listed sub-configs are always non-None. If your sub-config is optional (can be `None`), do NOT add it to `sub_configs`. Handle deserialization manually in `__init__` instead.
