@@ -75,3 +75,75 @@ Documentation/
 Someone reading the main repo can understand **all** changes without visiting the forks. The progress docs include full code snippets, design rationale, and before/after comparisons. The forks are there for `pip install -e` and upstream tracking, not as the primary record of work.
 
 **Lesson**: For research projects modifying HuggingFace libraries, fork mode is standard. Compensate for scattered commits by keeping thorough documentation in the main repo that records all fork changes. The main repo's commit history documents *what was done*; the fork repos contain *the actual code*.
+
+## Q2: What is a "Processor" in HuggingFace Transformers?
+
+**Key concept**: A Processor is **NOT a model** — it is a **preprocessing pipeline** that converts raw inputs (images, text, video, audio) into the tensor format the model expects.
+
+```
+Raw inputs                    Processor                         Model
+─────────────                ──────────                        ───────
+PIL images    ─┐
+text strings  ─┼──→  processor(images=..., text=...)  ──→  model(**inputs)
+audio arrays  ─┘         │                                     │
+                         ▼                                     ▼
+                   {"input_ids": ...,                    logits, generated text
+                    "pixel_values": ...,
+                    "attention_mask": ...}
+```
+
+The Processor lives in `processing_*.py`. The Model lives in `modeling_*.py`. They are separate files with separate responsibilities:
+- **Processor**: tokenization, image resizing/patching, audio mel extraction → tensors
+- **Model**: attention, RoPE, feedforward, generation → predictions
+
+Users almost always interact with the Processor, not the individual sub-components (tokenizer, image_processor) directly.
+
+## Q3: HuggingFace ProcessorMixin design pattern
+
+**Context**: Every multimodal model's Processor class inherits from `ProcessorMixin` and follows the same pattern.
+
+### The pattern has 4 parts:
+
+**1. Declare sub-component names** via `attributes`:
+```python
+class Qwen2VLProcessor(ProcessorMixin):
+    attributes = ["image_processor", "tokenizer"]
+```
+This tells ProcessorMixin: "this processor has two parts, stored as `self.image_processor` and `self.tokenizer`."
+
+**2. Declare sub-component classes** via `*_class` attributes (for auto-loading):
+```python
+    image_processor_class = "AutoImageProcessor"
+    tokenizer_class = "AutoTokenizer"
+```
+This tells `from_pretrained()` what class to instantiate for each sub-component (see Q20 in session3_QA.md for full explanation).
+
+**3. Provide a `__call__` method** that delegates to each sub-component:
+```python
+    def __call__(self, images=None, text=None, ...):
+        # Step 1: use self.image_processor to convert images → pixel_values
+        # Step 2: use self.tokenizer to convert text → input_ids
+        # Step 3: combine into one BatchFeature dict
+```
+
+**4. Inherit `save_pretrained` / `from_pretrained`** from ProcessorMixin:
+- `save_pretrained()` saves both the image_processor config and tokenizer to disk
+- `from_pretrained()` auto-loads both using the `*_class` attributes
+
+### Why this design?
+
+Without ProcessorMixin, users would have to manually load and coordinate multiple components:
+```python
+# Without ProcessorMixin (manual, error-prone):
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+image_processor = AutoImageProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+text_inputs = tokenizer(text, return_tensors="pt")
+image_inputs = image_processor(images, return_tensors="pt")
+inputs = {**text_inputs, **image_inputs}  # manually merge
+
+# With ProcessorMixin (one-liner):
+processor = Qwen2VLProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+inputs = processor(images=images, text=text, return_tensors="pt")  # handles everything
+```
+
+The Processor is the **user-facing API** — it hides the complexity of coordinating multiple preprocessing components behind a single `__call__` method.
