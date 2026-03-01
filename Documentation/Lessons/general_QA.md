@@ -147,3 +147,26 @@ inputs = processor(images=images, text=text, return_tensors="pt")  # handles eve
 ```
 
 The Processor is the **user-facing API** — it hides the complexity of coordinating multiple preprocessing components behind a single `__call__` method.
+
+## Q4: Notebook shows unexpected git diff after disconnecting Colab kernel — why?
+
+**Situation**: Opened `.ipynb` notebooks in Cursor with a remote Colab kernel connected. After disconnecting the kernel and closing the files, Cursor prompted to save. After saving, `git diff` showed changes even though no code was edited.
+
+**What changed** (all cosmetic, no functional impact):
+- Cell `source` format: single string `"source": "line1\nline2"` → array of lines `"source": ["line1\n", "line2\n"]`
+- `language_info` metadata block removed (Python version, mimetype, etc.)
+- Trailing newline added at end of file
+
+**Why it happens**: Different editors serialize `.ipynb` JSON differently when saving.
+- **With Colab kernel connected**: Cursor saves with `language_info` (kernel provides this metadata)
+- **After kernel disconnects**: Cursor saves without `language_info` (no kernel to provide it)
+- Cursor also prefers array-of-lines format for cell sources, while Colab uses single strings
+
+Both formats are valid per the Jupyter notebook spec — functionally identical, but git sees different JSON and flags it as a change.
+
+**How to avoid**: When the Colab kernel disconnects, if Cursor prompts you to save the notebook, **choose "Don't Save"**. You didn't change any code, so there's nothing to save. The save prompt is just Cursor re-serializing the file in its own format.
+
+**If it happens anyway**: These changes are safe to `git restore`:
+```bash
+git restore notebooks/the_affected_notebook.ipynb
+```

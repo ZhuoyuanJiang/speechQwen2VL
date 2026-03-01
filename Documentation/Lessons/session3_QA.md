@@ -1019,3 +1019,475 @@ processor = Qwen2VLProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
 ```
 
 See also: general_QA.md Q2 and Q3 for the broader ProcessorMixin design pattern.
+
+## Q21: How does `super().__init__()` work? Why can the parent class use child class attributes?
+
+**File**: `processing_qwen2_vl.py` → `Qwen2VLProcessor.__init__`
+
+**Confusion**: In `Qwen2VLProcessor.__init__`, we call `super().__init__(image_processor, tokenizer)`, which runs `ProcessorMixin.__init__`. Inside `ProcessorMixin.__init__`, the code accesses `self.attributes` — but `attributes` is defined on `Qwen2VLProcessor`, not on `ProcessorMixin`. Where does `self.attributes` come from in the parent class? How can the parent access the child's attribute?
+
+### The code in question
+
+```python
+# Parent class (simplified from transformers/processing_utils.py):
+class ProcessorMixin:
+    def __init__(self, *args):
+        for name, value in zip(self.attributes, args):   # ← self.attributes??
+            setattr(self, name, value)
+        # self.image_processor = args[0]
+        # self.tokenizer = args[1]
+
+# Child class (processing_qwen2_vl.py):
+class Qwen2VLProcessor(ProcessorMixin):
+    attributes = ["image_processor", "tokenizer"]   # ← defined HERE
+
+    def __init__(self, image_processor, tokenizer, ...):
+        super().__init__(image_processor, tokenizer)
+        # ↑ calls ProcessorMixin.__init__, but how does it find self.attributes?
+```
+
+### The key insight: `self` is always the same object
+
+`super().__init__()` does NOT create a new parent object. It runs the parent's `__init__` code **on the same `self`** — which is the child instance.
+
+### Simple example that makes it click
+
+```python
+class Animal:
+    def __init__(self):
+        print(self.sound)    # ← Animal never defines sound!
+
+class Dog(Animal):
+    sound = "woof"           # ← defined on the child
+
+    def __init__(self):
+        super().__init__()   # ← calls Animal.__init__(), but self is still the Dog
+
+dog = Dog()
+# prints: "woof"
+```
+
+`Animal.__init__` can use `self.sound` because `self` IS the `Dog` instance, and `Dog` has `sound = "woof"`.
+
+Different children, same parent code:
+
+```python
+class Animal:
+    def __init__(self):
+        print(f"I am a {self.sound} animal")
+
+class Dog(Animal):
+    sound = "woof"
+    def __init__(self):
+        super().__init__()
+
+class Cat(Animal):
+    sound = "meow"
+    def __init__(self):
+        super().__init__()
+
+Dog()   # prints: "I am a woof animal"
+Cat()   # prints: "I am a meow animal"
+```
+
+Same parent code, but `self.sound` gives different results because `self` is a different child each time. The parent doesn't need to know what `sound` is — it trusts that whatever child calls it will have `sound` defined.
+
+### Applied to our Processor
+
+Step by step when `proc = Qwen2VLProcessor(img_proc, tok)`:
+
+1. Python creates ONE object `proc` (type = `Qwen2VLProcessor`)
+2. Calls `Qwen2VLProcessor.__init__(proc, img_proc, tok)` → `self = proc`
+3. `super().__init__(img_proc, tok)` → calls `ProcessorMixin.__init__(proc, img_proc, tok)` → `self = proc` (same object!)
+4. `self.attributes` → `proc.attributes` → `["image_processor", "tokenizer"]` (because `proc` is a `Qwen2VLProcessor`)
+
+**One sentence**: `super().__init__()` means "run the parent's code, but still on me (the child)." This is exactly how `ProcessorMixin` can access `self.attributes` — because `self` is the `Qwen2VLProcessor` instance, which has `attributes` defined.
+
+## Q22: How do you decide what to write in a Processor's `__init__` vs `__call__`?
+
+**File**: `processing_qwen2_vl.py` → `Qwen2VLProcessor`
+
+**Context**: When writing a Processor from scratch, how do you know what goes in `__init__`? In neural networks, `__init__` defines trainable weights. What's the equivalent pattern for a Processor?
+
+### The thinking order (backwards from file order)
+
+You **design** `__init__` last, even though it appears first in the file:
+
+```
+Step 1: What does model.forward() expect?
+        ↓
+        input_ids, pixel_values, image_grid_thw, attention_mask
+        ↓
+Step 2: So __call__ must produce those. What tools does it need?
+        ↓
+        A tokenizer (to make input_ids)
+        An image_processor (to make pixel_values)
+        Token strings (to find/expand placeholders)
+        ↓
+Step 3: NOW you know what __init__ must store.
+        ↓
+        self.tokenizer, self.image_processor, self.image_token, self.video_token
+```
+
+### Why store tools (tokenizer) instead of outputs (input_ids)?
+
+**Confusion**: Since `__call__` produces `input_ids` and `pixel_values`, why not store those directly in `__init__` as `self.input_ids` and `self.pixel_values`?
+
+**Answer**: Because `input_ids` and `pixel_values` are **different every time** you call the processor. You can't store them at init time — you don't know what images or text the user will pass yet.
+
+- `self.tokenizer` — same tokenizer every call (a **tool**)
+- `self.image_token` — always `"<|image_pad|>"` every call (a **config value**)
+- `input_ids` — different for "What is this?" vs "Describe the image" (an **output**, changes per call)
+- `pixel_values` — different for a cat photo vs a dog photo (an **output**, changes per call)
+
+**Kitchen analogy**:
+
+```
+__init__ = stock the kitchen (one-time setup)
+    self.oven = Oven()           # same oven every meal
+    self.knife = Knife()         # same knife every meal
+
+__call__ = cook a meal (different ingredients each time)
+    def cook(self, chicken, vegetables):   # ← different every call!
+        chopped = self.knife.cut(vegetables)
+        cooked = self.oven.bake(chicken)
+        return meal
+```
+
+You store the **oven** (tokenizer), not the **chicken** (input text). The chicken changes every meal; the oven stays.
+
+### The rule
+
+| Store in `__init__` | Produce in `__call__` |
+|---|---|
+| Things that **never change** across calls | Things that **depend on this call's inputs** |
+| Tools: `self.tokenizer`, `self.image_processor` | Outputs: `input_ids`, `pixel_values` |
+| Config: `self.image_token = "<\|image_pad\|>"` | Derived values: `attention_mask`, `image_grid_thw` |
+
+### The pattern comparison
+
+| | Neural Network (`nn.Module`) | Processor (`ProcessorMixin`) |
+|---|---|---|
+| `__init__` stores | Trainable layers (`nn.Linear`, `nn.Conv2d`) | Sub-components (tokenizer, image_processor) + config values (token strings) |
+| `forward()` / `__call__` does | Tensor math (matmul, attention) | Preprocessing (tokenize, resize, build masks) |
+| Has trainable parameters? | Yes (millions) | No (zero) |
+
+## Q23: Audio processing block in `__call__` — why `audio_features_list`, where do 50 and 1500 come from, and what is `audio_inputs`?
+
+**File**: `processing_qwen2_vl.py` → `Qwen2VLProcessor.__call__`, the audio processing block (our Session 2 addition)
+
+### Where do 50 and 1500 come from?
+
+Both are derived from Whisper's fixed architecture:
+
+```
+Raw audio → Mel spectrogram: 3000 time frames (100 frames/sec × 30 sec max)
+          → WhisperEncoder conv1+conv2 (stride=2): 3000 / 2 = 1500 output steps
+```
+
+Whisper outputs **1500 time steps for 30 seconds** → **50 steps per second** (1500/30). So:
+- `50`: tokens per second of audio
+- `1500`: max tokens (30-second cap)
+- For a 3-second clip: `ceil(3.0 × 50) = 150` tokens
+
+(See also Q5 for the full Whisper output shape explanation.)
+
+### Why `audio_features_list`?
+
+Because a single `__call__` might process multiple audio clips:
+
+```python
+processor(
+    text=["Transcribe:", "Also transcribe:"],
+    audios=[(audio1, 16000), (audio2, 16000)]
+)
+```
+
+Each clip is processed individually through Whisper's feature extractor (they may have different durations), then `np.stack` combines them into one batch tensor for the model.
+
+### What is `audio_inputs`?
+
+A dictionary, initialized as empty `{}` earlier in `__call__`. After the audio block fills it:
+
+```python
+audio_inputs = {
+    "audio_features": np.ndarray shape (num_audios, 128, 3000),  # mel spectrograms
+    "audio_lengths":  [150, 75, 1500]                             # per-clip token counts
+}
+```
+
+### Why store `audio_lengths`?
+
+Whisper **always pads to 30 seconds**. A 3-second clip and a 25-second clip both produce `(128, 3000)` spectrograms — the short one is zero-padded. Without `audio_lengths`, the model can't tell real audio from padding.
+
+`audio_lengths` tells the model: "for clip 0, only the first 150 encoder outputs are meaningful." This connects to the trimming in `get_audio_features` (in `modeling_qwen2_vl.py`):
+
+```python
+encoder_output = self.audio_encoder(audio_features)  # (num_audios, 1500, 1280)
+trimmed = encoder_output[i, :audio_lengths[i], :]    # (150, 1280) — discard padding
+```
+
+### Design philosophy: who consumes what?
+
+The audio block produces data for **two different consumers**:
+
+| Data | Consumer | Purpose |
+|------|----------|---------|
+| `audio_features` (mel spectrograms) | **Model** (`modeling_qwen2_vl.py`) | Feed into WhisperEncoder |
+| `audio_lengths` (token counts per clip) | **Model** (`modeling_qwen2_vl.py`) | Trim encoder output to discard padding |
+| `audio_token_counts` (same values as audio_lengths) | **Processor** (used right here in `__call__`) | Expand `<\|audio_pad\|>` placeholders in text to the right count |
+
+`audio_features` and `audio_lengths` get merged into the final output dict and passed to the model. `audio_token_counts` is used immediately within the processor to expand placeholders — it never leaves this function.
+
+## Q24: The two-phase placeholder replacement trick
+
+**File**: `processing_qwen2_vl.py` → `Qwen2VLProcessor.__call__`, the image/video/audio placeholder expansion
+
+**Problem**: When text contains MULTIPLE images, each needing a different number of `<|image_pad|>` tokens, you can't just replace them one by one — the already-expanded tokens interfere.
+
+### Why naive replacement breaks
+
+```
+Start:   "What is <|image_pad|> and what is <|image_pad|> ?"
+                   ↑ image1 (needs 256 pads)     ↑ image2 (needs 64 pads)
+
+Step 1: Replace first <|image_pad|> with 256 copies:
+         "What is <|image_pad|>×256 and what is <|image_pad|> ?"
+
+Step 2: Replace "second" <|image_pad|> with 64 copies...
+         💥 BUT there are now 257 <|image_pad|> tokens in the string!
+         The code can't tell which is the original vs the 256 we just inserted.
+```
+
+### How the two-phase trick solves it
+
+```
+Start:   "What is <|image_pad|> and what is <|image_pad|> ?"
+
+Phase 1a: Replace first <|image_pad|> → 256 × <|placeholder|>   (DIFFERENT token)
+         "What is <|placeholder|>×256 and what is <|image_pad|> ?"
+                   ↑ placeholder                    ↑ still image_pad — no confusion
+
+Phase 1b: Replace next <|image_pad|> → 64 × <|placeholder|>
+         "What is <|placeholder|>×256 and what is <|placeholder|>×64 ?"
+                                                    ↑ only 1 image_pad was left, easy to find
+
+Phase 2:  Replace ALL <|placeholder|> → <|image_pad|>
+         "What is <|image_pad|>×256 and what is <|image_pad|>×64 ?"  ✅ CORRECT
+```
+
+The trick: use a **temporary different token** during expansion so already-expanded tokens don't interfere with finding the next original `<|image_pad|>`.
+
+### The actual code
+
+```python
+while self.image_token in text[i]:                                    # Phase 1 loop
+    num_image_tokens = image_grid_thw[index].prod() // merge_length
+    text[i] = text[i].replace(self.image_token, "<|placeholder|>" * num_image_tokens, 1)
+    #                                                                  ↑ the 1 means "replace only FIRST match"
+    index += 1
+text[i] = text[i].replace("<|placeholder|>", self.image_token)        # Phase 2: convert back
+```
+
+## Q25: What is `image_grid_thw` and how does `num_image_tokens` get computed?
+
+**File**: `processing_qwen2_vl.py` → `Qwen2VLProcessor.__call__`, image placeholder expansion
+
+**Context**: The line `num_image_tokens = image_grid_thw[index].prod() // merge_length` computes how many `<|image_pad|>` tokens to insert for each image. What do these pieces mean?
+
+### What is `image_grid_thw`?
+
+It comes from the image processor. When an image is processed, the image processor returns how many patches the image was divided into along each axis:
+
+```
+T = temporal patches  (1 for images, >1 for video)
+H = height patches    (image height ÷ patch_size)
+W = width patches     (image width ÷ patch_size)
+```
+
+Examples:
+```python
+# 448×448 image:   448/14=32 per side
+image_grid_thw[0] = tensor([1, 32, 32])
+
+# 224×224 image:   224/14=16 per side
+image_grid_thw[0] = tensor([1, 16, 16])
+
+# 896×448 image:   896/14=64 height, 448/14=32 width
+image_grid_thw[0] = tensor([1, 64, 32])
+
+# 20-frame video at 448×448:  20 frames / temporal_patch_size(2) = 10 temporal patches
+image_grid_thw[0] = tensor([10, 32, 32])
+```
+
+### Breaking down the computation
+
+```python
+merge_length = self.image_processor.merge_size**2  # 2² = 4
+
+# For a 448×448 image:
+image_grid_thw[index]       # tensor([1, 32, 32])
+    .prod()                 # 1 × 32 × 32 = 1024 total ViT patches
+    // merge_length         # 1024 // 4 = 256 LLM tokens after patch merge
+```
+
+`.prod()` multiplies all elements in the tensor together, giving the total number of ViT patches. Dividing by 4 (the merge factor) gives the final LLM token count, because the PatchMerger combines every 2×2 grid of patches into 1 token.
+
+## Q26: What does `_check_special_mm_tokens` do and why does it exist?
+
+**File**: `processing_qwen2_vl.py` → `Qwen2VLProcessor.__call__`, after tokenization
+
+**Context**: After tokenizing the expanded text, the processor calls `self._check_special_mm_tokens(text, text_inputs, modalities=["image", "video"])`. What is this for?
+
+### The problem: tokenizer truncation can silently lose placeholder tokens
+
+If the user sets `truncation=True` with a `max_length` that's too small for the content, the tokenizer chops off tokens from the end:
+
+```
+Expanded text: 500 text tokens + 1024 <|image_pad|> tokens = 1524 total
+max_length:    512
+After truncation: only 512 tokens survive → many <|image_pad|> tokens are gone
+```
+
+Without the check, the model later expects 1024 image embeddings but only finds ~12 placeholder positions → `masked_scatter` crashes with a confusing tensor size mismatch.
+
+### What the check does
+
+It compares the token count **before** tokenization (in the text string) vs **after** tokenization (in the `input_ids`):
+
+```python
+# Simplified logic:
+expected = text[i].count("<|image_pad|>")       # how many we put in
+actual = text_inputs["input_ids"][i].count(151655)  # how many survived tokenization
+
+if expected != actual:
+    raise ValueError(f"Expected {expected} image tokens but found {actual}. "
+                     f"Truncation may have removed some.")
+```
+
+This gives a clear, early error message instead of a mysterious crash later in the model.
+
+### Note: only checks image and video, not audio
+
+The current code only passes `modalities=["image", "video"]` — audio (`<|audio_pad|>`) is not checked. This is because the check existed before our audio addition. For ASR, the text prompt is typically short ("Transcribe the following audio:") and unlikely to be truncated, so it wasn't a priority. **TODO**: Consider adding `"audio"` to the modalities check in a future session if we encounter truncation issues with long audio inputs.
+
+## Q27: What is `BatchFeature` and how does the final return work?
+
+**File**: `processing_qwen2_vl.py` → `Qwen2VLProcessor.__call__`, the return statement
+
+**Context**: The last line of `__call__` is:
+```python
+return BatchFeature(
+    data={**text_inputs, **image_inputs, **videos_inputs, **audio_inputs}, tensor_type=return_tensors
+)
+```
+
+### What is `BatchFeature`?
+
+A **fancy dictionary** (inherits from `UserDict`) that can convert all its values to tensors. Defined in `transformers/feature_extraction_utils.py`.
+
+### Concrete example with actual numbers
+
+Say we process one image (448×448) and one audio clip (3 seconds):
+
+```python
+# The individual dicts before merging:
+text_inputs   = {
+    "input_ids": [[8826, 419, 151655, 151655, ...(×256), 151658, 151658, ...(×150), 4587]],
+    "attention_mask": [[1, 1, 1, ..., 1]],
+}
+image_inputs  = {
+    "pixel_values": np.ndarray(shape=(256, 1176)),       # 256 patches, each 1176 floats
+    "image_grid_thw": np.array([[1, 32, 32]]),            # T=1, H=32, W=32
+}
+videos_inputs = {}                                        # empty — no video
+audio_inputs  = {
+    "audio_features": np.ndarray(shape=(1, 128, 3000)),  # 1 clip, 128 mel bins, 3000 frames
+    "audio_lengths": [150],                               # 3 sec × 50 tokens/sec
+}
+
+# ** merge combines them into one dict (empty dict adds nothing):
+data = {
+    "input_ids": [[8826, 419, 151655, ...(×256), 151658, ...(×150), 4587]],
+    "attention_mask": [[1, 1, 1, ..., 1]],
+    "pixel_values": np.ndarray(shape=(256, 1176)),
+    "image_grid_thw": np.array([[1, 32, 32]]),
+    "audio_features": np.ndarray(shape=(1, 128, 3000)),
+    "audio_lengths": [150],
+}
+
+# BatchFeature wraps this and converts to PyTorch tensors (tensor_type="pt"):
+result = BatchFeature(data=data, tensor_type="pt")
+result["input_ids"]       # → torch.tensor([[8826, 419, 151655, ...]])
+result["pixel_values"]    # → torch.tensor(shape=(256, 1176))
+result["audio_features"]  # → torch.tensor(shape=(1, 128, 3000))
+
+# Pass directly to model:
+model(**result)
+# equivalent to: model(input_ids=result["input_ids"], pixel_values=result["pixel_values"], ...)
+```
+
+Each key in the `BatchFeature` dict maps to a parameter name in `model.forward()`. This is why the key names (`"input_ids"`, `"pixel_values"`, `"audio_features"`) must exactly match the parameter names the model expects.
+
+## Q28: What is `mm_token_type_ids` (Step 7) and why is it incomplete?
+
+**File**: `processing_qwen2_vl.py` → `Qwen2VLProcessor.__call__`, Step 7
+
+**Context**: When `return_mm_token_type_ids=True`, the processor builds a binary mask marking which positions are image tokens:
+
+```
+input_ids:         [8826,  419,   151655, 151655, 151655, 4587]
+                    "What" "is"   img_pad img_pad img_pad "?"
+
+mm_token_type_ids: [0,     0,     1,      1,      1,      0   ]
+                    text   text   image   image   image   text
+```
+
+**What it's for**: Some training setups use this to only compute loss on text tokens, apply different attention patterns to image vs text, or debug which tokens are which.
+
+**Why it's incomplete**: It only marks image tokens (`1`) — video tokens (`151656`) and audio tokens (`151658`) stay `0`, same as regular text. A complete version would use different IDs per modality:
+
+```
+# Current (only image):
+mm_token_type_ids: [0, 1, 1, 0, 0, 0, 0, 0]
+#                  text img img vid vid aud aud text  ← video/audio unmarked
+
+# Complete version (hypothetical):
+mm_token_type_ids: [0, 1, 1, 2, 2, 3, 3, 0]
+#                  text img img vid vid aud aud text
+```
+
+**For our project**: This doesn't matter. `return_mm_token_type_ids` defaults to `False`, so this entire block is skipped. It's an optional feature that was never fully extended beyond images.
+
+## Q29: What is `_get_num_multimodal_tokens` and what is it designed for?
+
+**File**: `processing_qwen2_vl.py` → `Qwen2VLProcessor._get_num_multimodal_tokens`
+
+**What it does**: Given just image/video **dimensions** (not actual pixels), it calculates how many LLM tokens that image/video will need:
+
+```python
+result = processor._get_num_multimodal_tokens(
+    image_sizes=[(448, 448), (224, 224)]
+)
+result.num_image_tokens  # → [256, 64]
+```
+
+Same math as `__call__` (`num_patches // merge_size**2`), but without touching any pixels — pure arithmetic.
+
+**What it's designed for**: Production deployment with serving frameworks like **vLLM**. When serving a model to many users simultaneously, the framework needs to plan GPU memory **before** processing each request:
+
+```
+User 1 sends: 4K image + "What is this?"
+User 2 sends: small thumbnail + "Describe this"
+User 3 sends: 30-second video + "Summarize"
+
+vLLM needs to answer INSTANTLY (before any image processing):
+  "User 1 needs ~4096 tokens of KV cache"
+  "User 2 needs ~64 tokens of KV cache"
+  "User 3 needs ~7680 tokens of KV cache"
+→ decides: I can fit User 1 + User 2 in this batch, User 3 waits
+```
+
+This decision must happen before any image processing. vLLM only knows image dimensions (from metadata), not actual pixels. `_get_num_multimodal_tokens` does the planning with just dimensions — no GPU needed.
+
+**For our project**: Not relevant. This is only for production API serving. We won't modify it.
