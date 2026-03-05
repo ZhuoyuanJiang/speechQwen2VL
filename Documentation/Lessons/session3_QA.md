@@ -1491,3 +1491,734 @@ vLLM needs to answer INSTANTLY (before any image processing):
 This decision must happen before any image processing. vLLM only knows image dimensions (from metadata), not actual pixels. `_get_num_multimodal_tokens` does the planning with just dimensions — no GPU needed.
 
 **For our project**: Not relevant. This is only for production API serving. We won't modify it.
+
+## Q30: What does "naturally generalizes to any grid size" mean? What is grid size?
+
+**File**: `image_processing_qwen2_vl.py`
+
+**Context**: A comment says Qwen2-VL's 2D RoPE "naturally generalizes to any grid size."
+
+**What is grid size?** The number of patches an image is divided into:
+
+```
+224×224 image → 16×16 grid   (224/14 = 16 patches per side)
+448×448 image → 32×32 grid
+896×448 image → 64×32 grid   (rectangular!)
+```
+
+**What "naturally generalizes" means**: Unlike models that only work with fixed input sizes (e.g., always 224×224), Qwen2-VL handles **any** image size. The 2D RoPE encodes (row, column) positions — whether the grid is 16×16 or 64×32, every patch gets a unique position encoding. No retraining needed for different resolutions.
+
+## Q31: How does `smart_resize` work? What is beta, floor, and ×28?
+
+**File**: `image_processing_qwen2_vl.py` → `smart_resize` function
+
+**Goal**: Resize an image so that:
+1. Total pixel count stays within budget (`min_pixels` to `max_pixels`)
+2. Aspect ratio is preserved
+3. Both dimensions are divisible by 28 (`patch_size(14) × merge_size(2)`)
+
+### What is beta (the scaling factor)?
+
+Beta is how much to shrink or grow each dimension. Since area = height × width, scaling both dimensions by β changes area by β². To go from an area ratio to a linear ratio, take the square root:
+
+```
+Original: 1920×1080 = 2,073,600 pixels
+Budget:   max_pixels = 1,003,520
+
+Area ratio:   2,073,600 / 1,003,520 = 2.065
+Linear scale: β = sqrt(2.065) = 1.437  ← divide dimensions by this
+
+Why sqrt? Because:
+  (height / β) × (width / β) = height × width / β²
+  To shrink area by 2.065×, shrink each side by sqrt(2.065)× = 1.437×
+```
+
+### What is floor(...) × 28?
+
+After scaling, round dimensions down to a multiple of 28:
+
+```
+h_bar = floor(1080 / 1.437 / 28) × 28
+
+Step by step:
+  1080 / 1.437 = 751.6        ← scaled height
+  751.6 / 28   = 26.83        ← how many 28-pixel blocks?
+  floor(26.83) = 26           ← round DOWN to whole number
+  26 × 28      = 728          ← final height
+```
+
+**Why 28?** Because `patch_size(14) × merge_size(2) = 28`. Dimensions must be divisible by 28 for patching and merging to work cleanly:
+
+```
+728 ÷ 14 (patch_size) = 52 patches  ✓ whole number
+52 ÷ 2 (merge_size)   = 26 merged   ✓ whole number
+```
+
+**Why round DOWN not UP?** To stay within the pixel budget:
+
+```
+Round DOWN: 728 × 1316 = 958,048    ✅ under max_pixels (1,003,520)
+Round UP:   756 × 1344 = 1,016,064  ❌ over budget!
+```
+
+### Full smart_resize example
+
+```
+Input:  1920×1080 image, max 1,003,520 pixels
+  1. Scale factor: β = sqrt(2,073,600 / 1,003,520) = 1.437
+  2. Height: 1080 / 1.437 = 751.6 → floor to ×28 → 728
+  3. Width:  1920 / 1.437 = 1336.1 → floor to ×28 → 1316
+Output: 728×1316 (aspect ratio 1.807 vs original 1.778 — very close!)
+```
+
+### Shrinking case (image too big, exceeds max_pixels)
+
+```python
+h_bar = max(factor, math.floor(height / beta / factor) * factor)
+```
+
+Inside out with numbers:
+
+```python
+height / beta          # 1080 / 1.437 = 751.6     ← scale down
+751.6 / factor         # 751.6 / 28 = 26.83       ← how many 28-blocks?
+math.floor(26.83)      # 26                        ← round DOWN (stay under budget)
+26 * factor            # 26 * 28 = 728             ← back to pixels
+max(factor, 728)       # max(28, 728) = 728        ← ensure at least 28 pixels
+```
+
+The `max(factor, ...)` is a safety guard — if the image is extremely small after scaling, ensure it's at least one 28-pixel block (one patch). Without it, a tiny image could get `floor(0.3) * 28 = 0` pixels.
+
+### Growing case (image too small, below min_pixels)
+
+```python
+h_bar = math.ceil(height * beta / factor) * factor
+```
+
+```python
+# Say a tiny 100×100 image, beta = 2.0 (need to scale UP)
+height * beta          # 100 * 2.0 = 200           ← scale up
+200 / factor           # 200 / 28 = 7.14           ← how many 28-blocks?
+math.ceil(7.14)        # 8                          ← round UP (reach min_pixels)
+8 * factor             # 8 * 28 = 224              ← back to pixels
+```
+
+Here `ceil` rounds UP because we need to **reach** `min_pixels`. Rounding down would leave us below the minimum.
+
+## Q32: Why rescale, normalize, and convert to RGB in image preprocessing?
+
+**File**: `image_processing_qwen2_vl.py` → `Qwen2VLImageProcessor.__init__`
+
+### Why rescale (divide by 255)?
+
+Raw pixels are integers 0-255. Neural networks work better with small floats:
+
+```
+Raw pixel:    [0, 128, 255]
+After ÷255:  [0.0, 0.502, 1.0]
+```
+
+Large values cause large gradients and unstable training. Rescaling to 0-1 keeps things numerically stable.
+
+### Why normalize (subtract mean, divide by std)?
+
+Centers data around zero, which helps gradient descent converge faster:
+
+```
+After rescale:     pixel = 0.502
+After normalize:   (0.502 - 0.481) / 0.269 = 0.078
+```
+
+Without normalization, all inputs are positive (0-1), creating a bias in gradient updates.
+
+### Where do the mean/std values come from?
+
+```python
+OPENAI_CLIP_MEAN = [0.481, 0.458, 0.408]  # R, G, B
+OPENAI_CLIP_STD  = [0.269, 0.261, 0.276]  # R, G, B
+```
+
+OpenAI computed these by averaging across **400 million training images** from the internet. They represent the "typical" pixel values of internet photos. Qwen2-VL's ViT was initialized from a CLIP-style model, so we must match the same mean/std it was trained with.
+
+### What if an image doesn't match CLIP's mean/std?
+
+This is **expected and fine**. The mean/std are not per-image — they're the **global average** across all internet images. Any single image will differ from the mean, and that's the point. Normalization shifts the distribution so the model sees input centered around zero. A very dark image might normalize to mostly negative values; a bright image to mostly positive. The model learned to handle this full range during training. No image will perfectly match the mean — and none needs to.
+
+### When convert to RGB? Does it cause errors?
+
+The ViT expects exactly 3 channels (`in_channels=3`). Non-RGB images would crash the Conv3D layer:
+
+```
+RGBA (PNG with transparency): drop alpha → RGB (3ch). No info loss for the visual content.
+Grayscale (1 channel): duplicate to 3 channels → RGB. The model sees it as a "colorless" image.
+CMYK (print format): convert color space → RGB. Standard color conversion, minimal loss.
+```
+
+**Does conversion cause errors?** Not really:
+- **RGBA → RGB**: The alpha (transparency) channel is irrelevant to understanding image content. The model was never trained on transparency data anyway.
+- **Grayscale → RGB**: Duplicating `[128]` to `[128, 128, 128]` is lossless. The model just sees a desaturated image, which it handles fine (it saw plenty of low-color images in training).
+- **CMYK → RGB**: Standard color conversion, same as what your browser does when displaying a CMYK image. Negligible precision loss.
+
+### Clarification: normalize targets mean=0, std=1 — not CLIP's values
+
+CLIP's mean/std are the **tool**, not the **target**. The goal is to standardize the data to mean=0, std=1:
+
+```
+Before normalize:  mean ≈ 0.481, std ≈ 0.269  (CLIP's statistics of internet images)
+After normalize:   mean ≈ 0,     std ≈ 1      (standardized)
+
+Formula: normalized = (pixel - CLIP_mean) / CLIP_std
+Example: (0.502 - 0.481) / 0.269 = 0.078  ← close to 0
+```
+
+CLIP's mean (0.481) and std (0.269) are used because they accurately describe the training data distribution. Subtracting the mean centers the data at 0; dividing by std scales it so the spread is 1. The result is zero-centered, unit-variance input — which is what the model was trained to expect.
+
+## Q33: What is `resample` (interpolation) in `resize()` and how do NEAREST, BILINEAR, BICUBIC differ?
+
+**File**: `image_processing_qwen2_vl.py` → `_preprocess` method, the `resize()` call
+
+**Context**: `resize(image, size=(h, w), resample=PILImageResampling.BICUBIC, ...)`. When you resize an image, new pixels need to be computed since they don't map 1-to-1. `resample` controls which algorithm is used.
+
+### Example: upscaling a 2×2 image to 4×4
+
+```
+Original 2×2:
+┌─────┬─────┐
+│ 100 │ 200 │
+├─────┼─────┤
+│  50 │ 150 │
+└─────┴─────┘
+```
+
+**NEAREST** — copy the closest original pixel (fast, blocky):
+```
+┌───┬───┬───┬───┐
+│100│100│200│200│
+├───┼───┼───┼───┤
+│100│100│200│200│
+├───┼───┼───┼───┤
+│ 50│ 50│150│150│
+├───┼───┼───┼───┤
+│ 50│ 50│150│150│
+└───┴───┴───┴───┘
+```
+
+**BILINEAR** — weighted average of 4 nearest pixels (smooth gradient):
+```
+For the ? between 100 and 200:
+  = 100 × 0.67 + 200 × 0.33 = 133  ← closer to 100, more weight on 100
+
+┌───┬───┬───┬───┐
+│100│133│167│200│
+├───┼───┼───┼───┤
+│ 83│111│139│183│
+├───┼───┼───┼───┤
+│ 67│ 89│128│167│
+├───┼───┼───┼───┤
+│ 50│ 83│117│150│
+└───┴───┴───┴───┘
+```
+
+**BICUBIC** — weighted average of 16 surrounding pixels using a cubic curve (smoothest):
+```
+┌───┬───┬───┬───┐
+│100│130│170│200│
+├───┼───┼───┼───┤
+│ 82│109│142│185│
+├───┼───┼───┼───┤
+│ 68│ 91│131│168│
+├───┼───┼───┼───┤
+│ 50│ 80│120│150│
+└───┴───┴───┴───┘
+```
+
+Slightly different from bilinear because bicubic fits a smooth curve through the points rather than straight-line interpolation.
+
+**Why BICUBIC for Qwen2-VL?** It gives the smoothest, most natural-looking resized images. For a ViT that needs to understand image content, smooth interpolation preserves visual details better than blocky nearest-neighbor.
+
+## Q34: Why rearrange pixels from 4D to 2D? (The patch reshaping design)
+
+**File**: `image_processing_qwen2_vl.py` → `_preprocess` method, the 9D reshape/transpose
+
+**Context**: The raw image is `(2, 3, 448, 448)` — frames × channels × height × width. The code rearranges it into `(num_patches, 1176)` — each row is one patch's pixels. Why?
+
+### Reason 1: The ViT needs patches, not pixels
+
+The ViT processes **patches** (small tiles), not individual pixels. Each patch becomes one token. The embedding layer takes a 1176-dim vector (one patch = 2 frames × 3 channels × 14 × 14 pixels) and projects it to 1280-dim. It needs all 1176 values of one patch grouped in a single row.
+
+```
+Before: one image as a spatial grid   (2, 3, 448, 448)
+After:  a list of patch vectors        (num_patches, 1176)
+```
+
+### Reason 2: Merge-aware ordering
+
+The patches aren't listed left-to-right, top-to-bottom. They're ordered so that patches that PatchMerger will combine (2×2 groups) are **adjacent** in the list:
+
+```
+Simple left-to-right (wrong for merging):
+  [patch(0,0), patch(0,1), patch(0,2), patch(0,3), patch(1,0), ...]
+
+Merge-aware ordering (what the 9D reshape does):
+  [patch(0,0), patch(0,1), patch(1,0), patch(1,1),   ← these 4 merge into 1 token
+   patch(0,2), patch(0,3), patch(1,2), patch(1,3),   ← these 4 merge into 1 token
+   ...]
+```
+
+Without this ordering, PatchMerger would merge wrong patches together (e.g., patches from different spatial regions). The 9D reshape + transpose cuts the image into patches AND orders them for merging in one operation.
+
+## Q35: The 9D reshape explained — all 9 dimensions with concrete numbers
+
+**File**: `image_processing_qwen2_vl.py` → `_preprocess` method
+
+**Context**: The code reshapes a 4D patch array `(grid_t, grid_h × grid_w, channel)` → 9 dimensions → transpose → 2D `(num_groups, group_pixels)`. This is the most confusing part of the image processor. Below is a full walkthrough with an 84×56 image example.
+
+### Setup
+
+```
+Image: 84 pixels tall × 56 pixels wide
+patch_size = 14, temporal_patch_size = 2, merge_size = 2
+grid_t = 1 (image = 1 temporal patch)
+grid_h = 84 ÷ 14 = 6 rows of patches
+grid_w = 56 ÷ 14 = 4 columns of patches
+
+Input to the 9D reshape is 4D: (2, 3, 84, 56)
+  2  = frames (image duplicated to 2 frames for temporal_patch_size=2)
+  3  = RGB channels
+  84 = pixel height
+  56 = pixel width
+```
+
+### What are "groups" vs "patches"?
+
+These are two different levels of organization:
+
+```
+24 patches in a 6×4 grid:
+
+┌────┬────┬────┬────┐
+│ P0 │ P1 │ P2 │ P3 │  row 0
+├────┼────┼────┼────┤
+│ P4 │ P5 │ P6 │ P7 │  row 1
+├────┼────┼────┼────┤
+│ P8 │ P9 │P10 │P11 │  row 2
+├────┼────┼────┼────┤
+│P12 │P13 │P14 │P15 │  row 3
+├────┼────┼────┼────┤
+│P16 │P17 │P18 │P19 │  row 4
+├────┼────┼────┼────┤
+│P20 │P21 │P22 │P23 │  row 5
+└────┴────┴────┴────┘
+
+merge_size = 2 → every 2×2 neighboring patches form one merge group:
+
+        col-group 0    col-group 1
+        ┌──────────┬──────────┐
+row-    │ Group 0  │ Group 1  │
+group 0 │ P0  P1   │ P2  P3   │
+        │ P4  P5   │ P6  P7   │
+        ├──────────┼──────────┤
+row-    │ Group 2  │ Group 3  │
+group 1 │ P8  P9   │ P10 P11  │
+        │ P12 P13  │ P14 P15  │
+        ├──────────┼──────────┤
+row-    │ Group 4  │ Group 5  │
+group 2 │ P16 P17  │ P18 P19  │
+        │ P20 P21  │ P22 P23  │
+        └──────────┴──────────┘
+
+24 patches → 6 groups → 6 LLM tokens
+```
+
+- **Patch** = smallest unit, 14×14 pixels. There are 24 of them.
+- **Group** = 2×2 patches that PatchMerger will combine into 1 token. There are 6 of them.
+- `grid_h // merge_size` = how many groups vertically = 6÷2 = **3** (how many bags)
+- `merge_size` = how many patches per group in each direction = **2** (how many items per bag)
+
+Like putting 6 apples into 3 bags, 2 per bag: 3 = number of bags, 2 = items per bag.
+
+### The 9 dimensions
+
+The actual code splits the 4D input into **9 separate axes**. Each original spatial axis is broken into 3 levels: group → merge → pixel. This is necessary so the transpose can rearrange them independently.
+
+```python
+patches = patches.reshape(
+    grid_t,                 # dim 0: temporal patches           = 1
+    temporal_patch_size,    # dim 1: frames per temporal patch  = 2 (image duplicated to 2 frames)
+    channel,                # dim 2: color channels             = 3 (RGB)
+    grid_h // merge_size,   # dim 3: row-groups                 = 6÷2 = 3
+    merge_size,             # dim 4: rows within merge group    = 2
+    patch_size,             # dim 5: pixel rows within patch    = 14
+    grid_w // merge_size,   # dim 6: col-groups                 = 4÷2 = 2
+    merge_size,             # dim 7: cols within merge group    = 2
+    patch_size,             # dim 8: pixel cols within patch    = 14
+)
+# shape: (1, 2, 3, 3, 2, 14, 2, 2, 14)
+```
+
+**Design rationale**: Notice how height and width each have 3 levels interleaved:
+- Height: dim 3 (which group) → dim 4 (which row in group) → dim 5 (which pixel row)
+- Width:  dim 6 (which group) → dim 7 (which col in group) → dim 8 (which pixel col)
+
+The transpose needs to pull dims from different levels into new positions — that's only possible if they're separate axes.
+
+### The transpose
+
+```python
+patches = patches.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
+#                           ─────────  ────  ───────────
+#                           "which      merge  pixel data
+#                            group"     pos    inside patch
+```
+
+After transpose, the 9 dims split cleanly into **two halves** for the final 2D flatten:
+
+```
+Before: (grid_t, temp_ps, chan, h_groups, m_h, ps_h, w_groups, m_w, ps_w)
+         dim:  0     1      2      3       4    5       6       7    8
+
+After:  (grid_t, h_groups, w_groups, m_h, m_w, chan, temp_ps, ps_h, ps_w)
+         dim:  0     3        6       4    7     2      1      5     8
+         ──────── "which patch" ────────── ──── "pixel data inside patch" ────
+              first 5 dims → axis 0             last 4 dims → axis 1
+```
+
+**Reading the "After" line — what each abbreviation means**:
+
+| Position | Abbreviation | = what in code | Size | Meaning |
+|----------|-------------|----------------|------|---------|
+| 0 | grid_t | `grid_t` | 1 | How many temporal patches |
+| 1 | h_groups | `grid_h // merge_size` | 3 | How many row-groups |
+| 2 | w_groups | `grid_w // merge_size` | 2 | How many col-groups |
+| 3 | m_h | `merge_size` | 2 | Rows per group |
+| 4 | m_w | `merge_size` | 2 | Cols per group |
+| 5 | chan | `channel` | 3 | RGB channels |
+| 6 | temp_ps | `temporal_patch_size` | 2 | Frames per temporal patch |
+| 7 | ps_h | `patch_size` | 14 | Pixel rows per patch |
+| 8 | ps_w | `patch_size` | 14 | Pixel cols per patch |
+
+- **First 5 dims** (0,3,6,4,7): identify which patch → flattened into axis 0
+  - `1 × 3 × 2 × 2 × 2 = 24 patches` (and they're in merge-group order!)
+- **Last 4 dims** (2,1,5,8): pixel data inside one patch → flattened into axis 1
+  - `3 × 2 × 14 × 14 = 1176 values per patch`
+
+The group dims (0,3,6) come before the merge dims (4,7), so patches from the same group are contiguous.
+
+### The final reshape to 2D
+
+```python
+patches = patches.reshape(
+    grid_t * grid_h * grid_w,                                    # = 1×6×4 = 24 patches
+    channel * temporal_patch_size * patch_size * patch_size       # = 3×2×14×14 = 1176 per patch
+)
+# shape: (24, 1176)
+```
+
+**Result**: 24 rows, one per patch. But they're in merge-group order, not left-to-right:
+
+```
+Rows  0-3  (Group 0): P0, P1, P4, P5    → PatchMerger → token 0
+Rows  4-7  (Group 1): P2, P3, P6, P7    → PatchMerger → token 1
+Rows  8-11 (Group 2): P8, P9, P12, P13  → PatchMerger → token 2
+Rows 12-15 (Group 3): P10, P11, P14, P15→ PatchMerger → token 3
+Rows 16-19 (Group 4): P16, P17, P20, P21→ PatchMerger → token 4
+Rows 20-23 (Group 5): P18, P19, P22, P23→ PatchMerger → token 5
+```
+
+PatchMerger takes every 4 consecutive rows → 1 token. 24 patches ÷ 4 = **6 LLM tokens**.
+
+### Summary table
+
+| Dim | Name | 84×56 image | Role after transpose |
+|-----|------|-------------|---------------------|
+| 0 | `grid_t` | 1 | "Which patch" (axis 0) — temporal index |
+| 1 | `temporal_patch_size` | 2 | "Pixel data" (axis 1) — frames per temporal patch |
+| 2 | `channel` | 3 | "Pixel data" (axis 1) — RGB channels |
+| 3 | `grid_h // merge_size` | 3 | "Which patch" (axis 0) — row-group (bag number) |
+| 4 | `merge_size` | 2 | "Which patch" (axis 0) — row within group (item in bag) |
+| 5 | `patch_size` | 14 | "Pixel data" (axis 1) — pixel rows |
+| 6 | `grid_w // merge_size` | 2 | "Which patch" (axis 0) — col-group (bag number) |
+| 7 | `merge_size` | 2 | "Which patch" (axis 0) — col within group (item in bag) |
+| 8 | `patch_size` | 14 | "Pixel data" (axis 1) — pixel cols |
+
+**The two halves**: After transpose, dims 0/3/6/4/7 = "which patch" (axis 0), dims 2/1/5/8 = "pixel data" (axis 1). Group dims (0,3,6) come before merge dims (4,7), ensuring patches in the same merge group are contiguous for PatchMerger.
+
+## Q36: What does `_preprocess` return and how is it used downstream?
+
+**File**: `image_processing_qwen2_vl.py` → `_preprocess` returns `(flatten_patches, (grid_t, grid_h, grid_w))`
+
+### What is `(grid_t, grid_h, grid_w)`?
+
+These are the **patch grid dimensions** — how many patches in each direction, NOT pixel counts:
+
+```
+84×56 image, patch_size=14:
+
+grid_t = 1   →  how many temporal patches (1 for images)
+grid_h = 6   →  how many rows of patches  (84 pixels ÷ 14 pixels/patch = 6)
+grid_w = 4   →  how many cols of patches  (56 pixels ÷ 14 pixels/patch = 4)
+
+Total patches = 1 × 6 × 4 = 24
+```
+
+Don't confuse with `patch_size=14` (pixels per patch) or `merge_size=2` (patches per merge group). grid_h/grid_w describe the **grid layout**, not individual patch or pixel sizes.
+
+### Return value 1: `flatten_patches` → becomes `pixel_values`
+
+This is the 2D array from the 9D reshape/transpose, shape `(num_patches, 1176)`. It flows through the model like this:
+
+```
+_preprocess() returns flatten_patches       shape: (24, 1176) per image
+      ↓
+preprocess() stacks all images together     shape: (total_patches, 1176)
+      ↓
+stored as result["pixel_values"]
+      ↓
+model.get_image_features(pixel_values, image_grid_thw)
+      ↓
+self.visual(pixel_values, grid_thw=...)     ← ViT forward
+      ↓
+Step 1: patch_embed(pixel_values)           each row 1176 → projected to 1280-dim vector
+Step 2: transformer blocks                  attention processing
+Step 3: merger(hidden_states)               every 4 adjacent patches merged into 1 token
+      ↓
+image_embeds                                shape: (num_tokens, 3584)
+```
+
+In short: `flatten_patches` is the ViT's input — each row is one patch's pixel values, and the ViT transforms them into embeddings.
+
+### Return value 2: `(grid_t, grid_h, grid_w)` → becomes `image_grid_thw`
+
+This tuple has **3 uses** in the model (all in `modeling_qwen2_vl.py`, ViT forward, lines 740-768):
+
+**Use 1: RoPE positional encoding** (line 746)
+```python
+rotary_pos_emb = self.rot_pos_emb(grid_thw)
+```
+grid_thw tells RoPE: these patches form a T×H×W grid, assign each patch a (t, h, w) 3D coordinate. Without grid_thw, the model wouldn't know where patches are spatially.
+
+**Use 2: cu_seqlens — variable-length sequence splitting** (line 750)
+```python
+cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(...)
+```
+Multiple images' patches are packed into one long sequence. cu_seqlens tells Flash Attention: "patches 0-23 belong to image 1, patches 24-87 belong to image 2", so attention doesn't cross image boundaries.
+
+**Use 3: Calculate LLM tokens per image** (line 1145)
+```python
+split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+```
+`grid_t × grid_h × grid_w ÷ merge_size² = LLM tokens per image`. Used to split the ViT output back into per-image chunks.
+
+## Q37: Where is `from_pretrained()` in Qwen2VLImageProcessor?
+
+**File**: `image_processing_qwen2_vl.py` — it's NOT defined there.
+
+`from_pretrained()` is **inherited** from the parent class chain:
+
+```
+Qwen2VLImageProcessor
+    → BaseImageProcessor
+        → ImageProcessingMixin    ← from_pretrained() lives here
+```
+
+Same pattern as `super().__init__()` (Q21) — the child class never defines this method, but Python walks up the inheritance chain and finds it in `ImageProcessingMixin`.
+
+What `from_pretrained()` does:
+1. Downloads `preprocessor_config.json` from the HuggingFace repo
+2. Reads the JSON → gets a dict like `{"size": {"height": 224}, "patch_size": 14, ...}`
+3. Passes those values as `**kwargs` to `Qwen2VLImageProcessor.__init__()`
+
+Same idea as `config.json` → `__init__()` for model configs (Q16).
+
+## Q38: Why does `get_number_of_image_patches` exist separately from `_preprocess`?
+
+**File**: `image_processing_qwen2_vl.py` → `get_number_of_image_patches`
+
+**Question**: Can't we just get `grid_h` and `grid_w` from `_preprocess` and calculate the patch count? Why a separate function?
+
+**Answer**: `_preprocess` requires an actual image (pixel data) and runs the full pipeline — resize, normalize, 9D reshape. `get_number_of_image_patches` only needs `height` and `width` as numbers, does pure math, and returns immediately.
+
+```python
+# _preprocess: slow — needs actual pixels, runs full pipeline
+patches, (grid_t, grid_h, grid_w) = self._preprocess(actual_image)
+
+# get_number_of_image_patches: fast — just arithmetic, no image needed
+num_patches = self.get_number_of_image_patches(height=1080, width=1920)
+```
+
+**Use case**: Estimating token count before actually processing images — e.g., checking whether a batch of images will fit in the LLM's 32768-token context window:
+
+```python
+for img in images:
+    num_patches = processor.get_number_of_image_patches(img.height, img.width)
+    num_tokens = num_patches // 4  # merge_size² = 4
+    if total_tokens + num_tokens < 32768:
+        selected.append(img)
+```
+
+Same idea as `_get_num_multimodal_tokens` in the processor (Q29) — both are "estimate token count without processing data" utility functions.
+
+## Q39: As an ML Engineer, how deeply do I need to understand HuggingFace source code?
+
+**Context**: After reading `image_processing_qwen2_vl.py` line-by-line, wondering: Do I need to memorize this? Can senior engineers write this from scratch? Or is "can read and understand" enough?
+
+### Things you do NOT need to memorize (read-level is enough)
+
+These are **framework implementation details**, not ML knowledge. Senior engineers don't memorize them either — they look at the source when needed:
+
+- HuggingFace patterns: `ProcessorMixin`, `from_pretrained()`, `_merge_kwargs`, `BaseImageProcessor` inheritance
+- The exact 9D reshape dimension order and transpose indices
+- Python syntax details: `extend` vs `append`, `data.update()`, `{**dict}` unpacking
+- Config loading pipeline: `preprocessor_config.json` → `__init__()` kwargs
+- Utility methods: `get_number_of_image_patches`, `_get_num_multimodal_tokens`
+
+### Things you SHOULD deeply understand (interview-level, whiteboard-drawable)
+
+These are **ML concepts** that come up in interviews and daily work:
+
+- **Image → patches → tokens pipeline**: How an image becomes patch vectors, goes through ViT, gets merged, and enters the LLM as token embeddings. Be able to draw this on a whiteboard.
+- **Patch merging trade-off**: Why merge 2×2 patches into 1 token (fewer tokens = faster inference, but loses spatial resolution). What `spatial_merge_size` controls.
+- **RoPE and 3D position encoding**: What Rotary Position Embeddings do, why Qwen2-VL uses 3D (T, H, W) instead of 1D, and how this helps the model understand spatial layout.
+- **smart_resize design**: Keep aspect ratio, align to patch boundary (×28), stay within min/max pixel budget. The *why*, not the exact floor/ceil formula.
+- **Variable-length attention** (cu_seqlens concept): How multiple images' patches are packed into one sequence, and how Flash Attention knows not to cross image boundaries.
+- **Vision-text fusion**: How vision embeddings replace placeholder tokens in the text sequence (masked_scatter concept from Q7).
+
+### The most valuable skill: modifying existing code
+
+Senior ML engineers rarely write HuggingFace processors from scratch. The real skill is:
+
+1. **Read** existing code and understand the pipeline
+2. **Identify** where to make changes for a new feature
+3. **Modify** the code correctly (e.g., adding audio support to a vision-language model)
+
+This is exactly what this project practices — reading Qwen2-VL's code and adding speech support. Being able to read line-by-line and then make targeted modifications is more valuable than memorizing any specific implementation.
+
+### Where does "reading line-by-line slowly but understanding everything" rank?
+
+This is already above average for ML Engineers. Most practitioners use `processor(images=..., text=...)` as a black box and never read the source. Being able to read and understand the implementation puts you in a strong position to debug issues, optimize performance, and extend models with new modalities.
+
+## Q40: Interview-ready answers — 5 core concepts for multimodal ML
+
+### 1. Image → patches → tokens pipeline
+
+```
+Raw image (3, 448, 448)
+    ↓  Temporal padding: duplicate frame → (2, 3, 448, 448)
+    ↓  Conv3D patch_embed: each 14×14×2 block → one 1280-dim vector
+    ↓  Patch grid: 1×32×32 = 1024 patches, each 1280-dim
+    ↓  ViT transformer blocks: self-attention across all patches
+    ↓  PatchMerger: every 2×2 = 4 adjacent patches → 1 token
+    ↓  Result: 1024÷4 = 256 LLM tokens, each 3584-dim
+    ↓  masked_scatter: replace <|image_pad|> placeholders in text sequence
+    ↓  LLM does attention over vision + text tokens together
+```
+
+Key point: images are not fed in whole. They're cut into small patches, each independently encoded, merged to reduce count, then mixed into the text sequence.
+
+**Patch grid** — just division, no neural network:
+```
+Image: 448×448 pixels, patch_size = 14
+grid_h = 448 ÷ 14 = 32 rows of patches
+grid_w = 448 ÷ 14 = 32 cols of patches
+grid_t = 1 (images have 1 temporal patch)
+Total patches = 1 × 32 × 32 = 1024
+```
+
+**Conv3D patch_embed** — the ViT's first layer, cuts pixels into vectors:
+```python
+Conv3D(
+    in_channels=3,          # RGB
+    out_channels=1280,      # output dim (ViT hidden size)
+    kernel_size=(2, 14, 14) # looks at 2 frames × 14 rows × 14 cols at a time
+    stride=(2, 14, 14)      # non-overlapping, jumps one full patch each step
+)
+```
+
+How it works:
+```
+Input: (1, 3, 2, 448, 448)  — batch=1, 3 channels, 2 frames, 448×448
+
+Conv3D kernel slides across the input like a window:
+  Window size: 2 frames × 14px × 14px × 3 channels = 1176 input values
+  Each window position → 1280 output values (one 1280-dim vector)
+
+Sliding positions:
+  temporal: 2 frames, stride=2  → 1 position  (grid_t=1)
+  height:   448px,    stride=14 → 32 positions (grid_h=32)
+  width:    448px,    stride=14 → 32 positions (grid_w=32)
+
+Output: (1, 1280, 1, 32, 32)  — batch, channels, t, h, w
+  → reshape to (1024, 1280)   — 1024 patches, each 1280-dim
+```
+
+Conv3D = "cut and compress" in one step. It slices the image into 14×14 patches and projects each patch from raw pixels (1176 values) to a 1280-dim vector.
+
+This relates to the 9D reshape from image_processing (Q35):
+- Image processor's 9D reshape: rearranges pixels into `(1024, 1176)` format
+- Conv3D patch_embed: projects `(1024, 1176)` → `(1024, 1280)` — a linear projection
+
+### 2. Why patch merge? What's the trade-off?
+
+Without merge: a 448×448 image = 32×32 = 1024 tokens into the LLM. LLM attention is O(n²), so 1024 vision tokens + text tokens is very expensive.
+
+With merge (merge_size=2): 1024 → 256 tokens, ~16× less LLM compute.
+
+```
+merge_size=1: 1024 tokens → high resolution, slow     (one token per 14×14 area)
+merge_size=2: 256 tokens  → medium resolution, fast    (one token per 28×28 area) ← Qwen2-VL
+merge_size=4: 64 tokens   → low resolution, fastest    (one token per 56×56 area)
+```
+
+Larger merge → fewer tokens → faster inference, but more spatial detail lost. OCR tasks need high resolution (small text), image classification doesn't. Qwen2-VL picks merge_size=2 as a speed/accuracy balance.
+
+### 3. What is RoPE? Why does Qwen2-VL use 3D RoPE?
+
+**RoPE (Rotary Position Embedding)**: Encodes each token's position by turning it into a rotation angle applied to Q and K in attention. Tokens farther apart get larger angle differences, so attention scores naturally decay with distance.
+
+**Standard LLMs use 1D RoPE**: each token gets a single position number 0, 1, 2, 3...
+
+**Qwen2-VL uses 3D RoPE**: each token gets three coordinates (t, h, w):
+```
+Text tokens:    (t, 0, 0), (t+1, 0, 0), (t+2, 0, 0)    — time axis only
+Image patches:  (t, 0, 0), (t, 0, 1), (t, 1, 0), (t, 1, 1)  — spatial coordinates
+Video patches:  (0, h, w), (1, h, w), ...                — all three axes
+```
+
+**Why 3D?** With 1D, patch (0,0) and (0,1) get positions 0 and 1 (adjacent), but (0,0) and (1,0) (directly below) get positions 0 and 32 (far apart). The model would incorrectly think vertically-adjacent patches are distant. 3D RoPE makes spatial distances correctly reflect real 2D/3D proximity.
+
+### 4. smart_resize strategy
+
+**Problem**: ViT requires height and width to be multiples of 28 (= patch_size 14 × merge_size 2). But user images can be any size, e.g. 1920×1080.
+
+**smart_resize approach**:
+```
+Step 1: Keep aspect ratio unchanged (no distortion)
+Step 2: Scale so that min_pixels ≤ h×w ≤ max_pixels
+Step 3: Round h and w each to nearest multiple of 28
+
+1920×1080 → total pixels 2,073,600 > max_pixels (1,003,520)
+  → proportional scale: 1330×748 (≈1,003,520 pixels)
+  → align to ×28: 1316×756
+```
+
+Why not resize to a fixed size (e.g. 224×224)? That would distort the aspect ratio — a panorama squeezed into a square looks wrong. Qwen2-VL supports **arbitrary resolution**, which is one of its selling points.
+
+### 5. How attention handles multiple images (cu_seqlens)
+
+**Problem**: Patches from 3 images are packed into one long sequence for the ViT. But images should not attend to each other — image 1's patches shouldn't see image 2's content.
+
+```
+Packed patch sequence:
+[img1_p0, ..., img1_p23 | img2_p0, ..., img2_p63 | img3_p0, ..., img3_p15]
+ ←── 24 patches ────────→ ←── 64 patches ────────→ ←── 16 patches ────────→
+```
+
+**cu_seqlens (cumulative sequence lengths)** tells Flash Attention where the boundaries are:
+```python
+cu_seqlens = [0, 24, 88, 104]
+#             ↑   ↑   ↑    ↑
+#           start img1 img2 img3
+#                 ends ends ends
+```
+
+Flash Attention uses this to enforce: attention within each image is free, attention across images = 0. No padding to equal length needed, no attention mask needed — more efficient than traditional approaches.
