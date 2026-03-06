@@ -63,7 +63,9 @@ else
     cd "$FORKS_DIR"
     git clone "$TRANSFORMERS_REPO"
     cd transformers
-    git checkout -b "$TRANSFORMERS_BRANCH" 2>/dev/null || git checkout "$TRANSFORMERS_BRANCH"
+    # Use plain checkout (no -b) so git's DWIM auto-tracks origin/speech-qwen2vl.
+    # With -b, git would create a new branch from HEAD (main) — wrong code.
+    git checkout "$TRANSFORMERS_BRANCH"
 fi
 
 echo "Installing transformers from fork (editable)..."
@@ -96,7 +98,9 @@ else
     # since the code inside is still Qwen2-VL and we want our project references consistent.
     git clone "$QWEN_VL_REPO" Qwen2-VL
     cd Qwen2-VL
-    git checkout -b "$QWEN_VL_BRANCH" 2>/dev/null || git checkout "$QWEN_VL_BRANCH"
+    # Use plain checkout (no -b) so git's DWIM auto-tracks origin/speech-qwen2vl.
+    # With -b, git would create a new branch from HEAD (main) — wrong code.
+    git checkout "$QWEN_VL_BRANCH"
 fi
 
 echo "Installing qwen-vl-utils from fork (editable)..."
