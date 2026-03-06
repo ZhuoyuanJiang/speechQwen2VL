@@ -1,84 +1,74 @@
-# ---
-# jupyter:
-#   jupytext:
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.19.1
-#   kernelspec:
-#     display_name: Python 3
-#     language: python
-#     name: python3
-# ---
-
-# %% [markdown]
-# # 05 - Training Stage 1: Audio Projector Only
-#
-# **Goal**: Train the randomly initialized `audio_projector` (~17M params) to map Whisper audio embeddings into the LLM's text embedding space. All other model weights are frozen.
-#
-# **What we train**:
-# - `model.model.audio_projector` — 2-layer MLP (Whisper hidden dim → LLM hidden dim)
-# - Everything else is frozen (~8.3B params)
-#
-# **Prerequisites**:
-# - Notebook 04 completed (inference pipeline verified)
-# - Model at `DanJZY/Qwen2-VL-7B-Speech` has audio encoder but random projector
-#
-# **Where to run**: Server (2x A6000, 48GB each). Conda env `speech_qwen2vl` with editable fork installs.
-
-# %% [markdown]
-# ## 1. Environment Setup
-
-# %%
-# No pip installs — server has conda env with editable fork installs.
-# If running on a fresh machine, see scripts/setup_forks.sh.
-
+# Dataset cache must be set BEFORE importing datasets library,
+# otherwise HF reads the default cache path at import time.
 import os
+os.environ["HF_DATASETS_CACHE"] = "/ssd1/zhuoyuan/speechQwen2VL/data"
+
+import subprocess
 import torch
 import gc
 import time
 import math
 from datasets import load_dataset, Audio
-from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
+from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor, Trainer, TrainingArguments
 from qwen_vl_utils import process_vision_info
-from trl import SFTConfig, SFTTrainer
 import transformers
 
-print(f"transformers: {transformers.__version__}")
-print(f"transformers path: {transformers.__file__}")
+# Auto-select the GPU with the most free memory, then restrict visibility to that GPU only.
+# This must happen before any torch CUDA call so the Trainer sees exactly 1 GPU.
+def get_free_gpu():
+    """Return the GPU index with the most free memory."""
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,memory.used,memory.free",
+         "--format=csv,noheader,nounits"],
+        capture_output=True, text=True,
+    )
+    gpus = []
+    for line in result.stdout.strip().split("\n"):
+        idx, used, free = [int(x.strip()) for x in line.split(",")]
+        gpus.append((idx, used, free))
+
+    available = [(idx, free) for idx, used, free in gpus if used < 500]  # <500 MB used = idle
+    if not available:
+        available = [(idx, free) for idx, _, free in gpus]  # fallback: pick least-busy
+    best_idx, best_free = max(available, key=lambda x: x[1])
+
+    idle_ids = [str(idx) for idx, used, _ in gpus if used < 500]
+    print(f"Available (idle) GPUs: [{', '.join(idle_ids) if idle_ids else 'none'}]")
+    return best_idx
+
+GPU_ID = get_free_gpu()
+os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_ID)
+# After this, torch sees only 1 GPU. It becomes cuda:0 regardless of the physical index.
+DEVICE = "cuda:0"
+
+props = torch.cuda.get_device_properties(0)
+print(f"Using GPU {GPU_ID}: {props.name} ({props.total_memory / 1024**3:.1f} GB)")
+print(f"Visible devices: {os.environ['CUDA_VISIBLE_DEVICES']} (torch sees {torch.cuda.device_count()} GPU)")
+
+print(f"\ntransformers: {transformers.__version__} ({transformers.__file__})")
 print(f"torch: {torch.__version__}")
-print(f"CUDA available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    for i in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(i)
-        print(f"GPU {i}: {props.name} ({props.total_memory / 1024**3:.1f} GB)")
 
 # HuggingFace login
 from huggingface_hub import get_token
 HF_TOKEN = get_token()
 if HF_TOKEN:
     os.environ["HF_TOKEN"] = HF_TOKEN
-    print("\nHF token loaded from cache.")
+    print("HF token loaded.")
 else:
     HF_TOKEN = os.environ.get("HF_TOKEN")
     if HF_TOKEN:
-        print("\nHF token loaded from environment.")
+        print("HF token loaded from environment.")
     else:
-        print("\nNo HF token found. Set HF_TOKEN or run `huggingface-cli login`.")
+        print("No HF token found. Set HF_TOKEN or run `huggingface-cli login`.")
 
-# %% [markdown]
-# ## 2. Download Dataset
-#
-# Downloads a subset of `speechbrain/LargeScaleASR`:
-# - **Train**: ~20 shards from `small/` split
-# - **Test**: 100 samples from `test/` split
-#
-# Audio column is cast to `decode=False` to keep raw bytes (needed by our `process_vision_info` pipeline).
-#
-# After loading, we pre-filter over-budget samples whose total token count would exceed `max_length=2048`.
+# HF_DATASETS_CACHE was set in cell-2 (before importing datasets) to:
+#   /ssd1/zhuoyuan/speechQwen2VL/data
+# This ensures all downloaded data goes to the local SSD, not hf_cache.
 
-# %%
+# The small/ split has 72 shards total (~107K samples). We use 20 shards (~30K samples)
+# following the skeleton notebook — sufficient for Stage 1 projector training.
+# To scale up: change glob to "small/train-*" for all 72 shards.
+
 train_dataset = load_dataset(
     "speechbrain/LargeScaleASR",
     data_files=["small/train-0000*", "small/train-0001*"],
@@ -100,11 +90,9 @@ test_dataset = test_dataset.cast_column("wav", Audio(decode=False))
 
 print(f"Train samples: {len(train_dataset)}")
 print(f"Test samples:  {len(test_dataset)}")
+print(f"Dataset cache: {os.environ['HF_DATASETS_CACHE']}")
 print(f"Columns:       {train_dataset.column_names}")
-print(f"Sample wav type: {type(train_dataset[0]['wav'])}")
-print(f"Sample wav keys: {list(train_dataset[0]['wav'].keys())}")
 
-# %%
 # Pre-filter over-budget samples.
 # Total token budget per sample: audio_pads + transcript_tokens + template_overhead <= MAX_LENGTH
 #
@@ -160,11 +148,6 @@ print(f"Test:  {test_before} → {len(test_dataset)} (dropped {test_before - len
 
 del _processor, _tokenizer
 
-
-# %% [markdown]
-# ## 3. Memory Cleanup Utility
-
-# %%
 def clear_memory():
     """Clean up GPU memory by deleting common global variables and clearing CUDA cache."""
     for var_name in ['inputs', 'model', 'processor', 'trainer', 'peft_model', 'bnb_config']:
@@ -185,17 +168,10 @@ def clear_memory():
 
 print("clear_memory() defined.")
 
-# %% [markdown]
-# ## 4. Load Model & Processor, Freeze Parameters
-#
-# Load from HuggingFace in bf16, single GPU (no quantization for Stage 1).
-# Freeze everything, then unfreeze only `audio_projector`.
-
-# %%
 model = Qwen2VLForConditionalGeneration.from_pretrained(
     REPO_ID,
     torch_dtype=torch.bfloat16,
-    device_map="cuda:0",  # single GPU — fits in ~22-25 GB on 48 GB A6000
+    device_map=DEVICE,  # auto-selected GPU with most free memory
 )
 processor = Qwen2VLProcessor.from_pretrained(REPO_ID)
 
@@ -232,31 +208,6 @@ print("\nFreeze verification passed: only audio_projector is trainable.")
 if torch.cuda.is_available():
     print(f"\nGPU memory used: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
-
-# %% [markdown]
-# ## 5. Data Collator — `AudioTextCollator`
-#
-# Converts raw dataset samples into model-ready batches with masked labels.
-#
-# **Pipeline**: sample → conversation messages → `process_vision_info()` → chat template → processor → label masking
-#
-# **Label masking strategy**:
-# 1. Tokenize `<|im_start|>assistant\n` once in `__init__`, cache as token ID list
-# 2. Search each sequence's `input_ids` for this exact token subsequence
-# 3. Mask everything up to and including the match → -100
-# 4. Keep everything after (transcript + `<|im_end|>`) as real labels
-# 5. Mask padding tokens → -100
-#
-# ```
-# <|im_start|>system\n...<|im_end|>\n          → -100 (masked)
-# <|im_start|>user\n<|audio_start|>...<|im_end|> → -100 (masked)
-# <|im_start|>assistant\n                        → -100 (masked)
-# TRANSCRIPT TEXT                                → REAL LABELS
-# <|im_end|>                                     → REAL LABEL (stop token)
-# [padding]                                      → -100 (masked)
-# ```
-
-# %%
 class AudioTextCollator:
     """Collator that converts raw dataset samples into training batches with masked labels."""
 
@@ -353,12 +304,23 @@ class AudioTextCollator:
             mask_end = pos + len(self.assistant_start_tokens)
             labels[i, :mask_end] = -100
 
+            # Find <|im_end|> after the assistant content and mask everything after it.
+            # The chat template adds a trailing \n after <|im_end|> — we want the model
+            # to learn to stop at <|im_end|>, not predict the trailing \n.
+            im_end_positions = (seq == self.im_end_id).nonzero(as_tuple=True)[0]
+            # Get the last <|im_end|> that's after the assistant marker
+            im_end_after_assistant = im_end_positions[im_end_positions > mask_end]
+            assert len(im_end_after_assistant) > 0, (
+                f"Sample {i}: no <|im_end|> found after assistant marker. "
+                f"The transcript was likely truncated."
+            )
+            last_im_end = im_end_after_assistant[0].item()  # first (and should be only) <|im_end|> after assistant
+            labels[i, last_im_end + 1:] = -100  # mask everything after <|im_end|>
+
             # Mask padding tokens
             labels[i, seq == self.pad_token_id] = -100
 
         # Safety net: verify every sample has real labels and ends with <|im_end|>.
-        # Dataset-level filtering (Section 2) should have removed over-budget samples.
-        # If truncation still ate the transcript or its <|im_end|>, something is wrong.
         for i in range(labels.shape[0]):
             real_label_mask = labels[i] != -100
             real_label_count = real_label_mask.sum().item()
@@ -368,7 +330,7 @@ class AudioTextCollator:
                 f"This sample should have been removed by dataset pre-filtering."
             )
 
-            # Verify last real label is <|im_end|> (catches partial truncation)
+            # Verify last real label is <|im_end|>
             real_label_ids = labels[i][real_label_mask]
             assert real_label_ids[-1].item() == self.im_end_id, (
                 f"Sample {i}: last real label is {real_label_ids[-1].item()}, "
@@ -381,7 +343,6 @@ class AudioTextCollator:
 
 collator = AudioTextCollator(processor)
 
-# %%
 # Test collator on a small batch
 test_batch = collator([train_dataset[0], train_dataset[1]])
 
@@ -419,11 +380,7 @@ for j in range(len(sample_labels)):
 
 del test_batch
 
-# %% [markdown]
-# ## 6. SFTConfig
-
-# %%
-sft_config = SFTConfig(
+training_args = TrainingArguments(
     output_dir="./checkpoints/stage1_audio_projector",
     num_train_epochs=3,
     per_device_train_batch_size=2,
@@ -436,32 +393,27 @@ sft_config = SFTConfig(
     logging_steps=10,
     report_to="wandb",
     eval_strategy="steps",
-    eval_steps=100,
+    eval_steps=500,
     save_strategy="steps",
     save_steps=500,
     save_total_limit=3,
     remove_unused_columns=False,        # collator needs raw dataset columns
-    dataset_text_field=None,            # bypass SFTTrainer's built-in processing
-    dataset_kwargs={"skip_prepare_dataset": True},  # prevent SFTTrainer from preprocessing
-    max_seq_length=MAX_LENGTH,          # NOTE: if trl version uses max_length instead, rename this
     gradient_checkpointing=True,
     gradient_checkpointing_kwargs={"use_reentrant": False},
     dataloader_num_workers=4,
     dataloader_pin_memory=True,
 )
 
-print(f"Output dir:      {sft_config.output_dir}")
-print(f"Epochs:          {sft_config.num_train_epochs}")
-print(f"Batch size:      {sft_config.per_device_train_batch_size}")
-print(f"Grad accum:      {sft_config.gradient_accumulation_steps}")
-print(f"Effective batch: {sft_config.per_device_train_batch_size * sft_config.gradient_accumulation_steps}")
-print(f"Learning rate:   {sft_config.learning_rate}")
-print(f"Gradient ckpt:   {sft_config.gradient_checkpointing}")
+print(f"Output dir:      {training_args.output_dir}")
+print(f"Epochs:          {training_args.num_train_epochs}")
+print(f"Batch size:      {training_args.per_device_train_batch_size}")
+print(f"Eval batch size: {training_args.per_device_eval_batch_size}")
+print(f"Grad accum:      {training_args.gradient_accumulation_steps}")
+print(f"Effective batch: {training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps}")
+print(f"Learning rate:   {training_args.learning_rate}")
+print(f"Gradient ckpt:   {training_args.gradient_checkpointing}")
+print(f"Eval steps:      {training_args.eval_steps}")
 
-# %% [markdown]
-# ## 7. wandb Init
-
-# %%
 import wandb
 
 wandb.init(
@@ -470,22 +422,18 @@ wandb.init(
     config={
         "trainable_params": trainable_params,
         "total_params": total_params,
-        "learning_rate": sft_config.learning_rate,
-        "num_epochs": sft_config.num_train_epochs,
-        "per_device_batch_size": sft_config.per_device_train_batch_size,
-        "gradient_accumulation_steps": sft_config.gradient_accumulation_steps,
-        "effective_batch_size": sft_config.per_device_train_batch_size * sft_config.gradient_accumulation_steps,
+        "learning_rate": training_args.learning_rate,
+        "num_epochs": training_args.num_train_epochs,
+        "per_device_batch_size": training_args.per_device_train_batch_size,
+        "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+        "effective_batch_size": training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps,
     },
 )
 print("wandb initialized.")
 
-# %% [markdown]
-# ## 8. Create Trainer & Train
-
-# %%
-trainer = SFTTrainer(
+trainer = Trainer(
     model=model,
-    args=sft_config,
+    args=training_args,
     train_dataset=train_dataset,
     eval_dataset=test_dataset,
     data_collator=collator,
@@ -498,15 +446,6 @@ print(f"Starting training...")
 
 trainer.train()
 
-
-# %% [markdown]
-# ## 9. Verify — Post-Training Inference
-#
-# Quick inference test to check that the trained projector produces coherent transcriptions
-# (should be much better than the garbage output from Notebook 04).
-# Run this **before** pushing to HuggingFace so we don't publish a bad checkpoint.
-
-# %%
 def run_inference(model, processor, messages, max_new_tokens=256):
     """Run inference on a single conversation (same as Notebook 04)."""
     image_inputs, video_inputs, audio_inputs = process_vision_info(messages)
@@ -534,12 +473,6 @@ def run_inference(model, processor, messages, max_new_tokens=256):
 
 print("run_inference() defined.")
 
-# %% [markdown]
-# ## 10. Push to HuggingFace & Cleanup
-#
-# Only 1 of 4 safetensor shards should change (the one containing `audio_projector` weights).
-
-# %%
 # Test on a few samples from the test set
 for idx in [0, 1, 2]:
     test_sample = test_dataset[idx]
@@ -560,12 +493,10 @@ for idx in [0, 1, 2]:
     print(f"Ground truth:  {test_sample['text']}")
     print()
 
-# %%
 model.push_to_hub(REPO_ID)
 processor.push_to_hub(REPO_ID)
 print(f"Model and processor pushed to {REPO_ID}")
 
-# %%
 wandb.finish()
 clear_memory()
 print("Training complete. Cleanup done.")

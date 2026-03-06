@@ -22,6 +22,9 @@ checkpoints/
 wandb/
 runs/
 
+# Data (symlink → local SSD)
+data/
+
 # Large files
 *.wav
 *.mp3
