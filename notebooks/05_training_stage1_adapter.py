@@ -1,7 +1,48 @@
+# ---
+# jupyter:
+#   jupytext:
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.1
+#   kernelspec:
+#     display_name: Python 3
+#     language: python
+#     name: python3
+# ---
+
+# %% [markdown]
+# # 05 - Training Stage 1: Audio Projector Only
+#
+# **Goal**: Train the randomly initialized `audio_projector` (~17M params) to map Whisper audio embeddings into the LLM's text embedding space. All other model weights are frozen.
+#
+# **What we train**:
+# - `model.model.audio_projector` — 2-layer MLP (Whisper hidden dim → LLM hidden dim)
+# - Everything else is frozen (~8.3B params)
+#
+# **Prerequisites**:
+# - Notebook 04 completed (inference pipeline verified)
+# - Model at `DanJZY/Qwen2-VL-7B-Speech` has audio encoder but random projector
+#
+# **Where to run**: Server (2x A6000, 48GB each). Conda env `speech_qwen2vl` with editable fork installs.
+
+# %% [markdown]
+# ## 1. Environment Setup
+
+# %%
+# Change to project root so all relative paths (./data, ./checkpoints) work correctly.
+# This also ensures HF_DATASETS_CACHE points to the right place.
+import os
+os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..") 
+         if "__file__" in dir() 
+         else os.path.join(os.getcwd(), "..") if os.path.basename(os.getcwd()) == "notebooks" 
+         else os.getcwd())
+print(f"Working directory: {os.getcwd()}")
+
 # Dataset cache must be set BEFORE importing datasets library,
 # otherwise HF reads the default cache path at import time.
-import os
-os.environ["HF_DATASETS_CACHE"] = "/ssd1/zhuoyuan/speechQwen2VL/data"
+os.environ["HF_DATASETS_CACHE"] = os.path.abspath("./data")
 
 import subprocess
 import torch
@@ -44,6 +85,7 @@ DEVICE = "cuda:0"
 props = torch.cuda.get_device_properties(0)
 print(f"Using GPU {GPU_ID}: {props.name} ({props.total_memory / 1024**3:.1f} GB)")
 print(f"Visible devices: {os.environ['CUDA_VISIBLE_DEVICES']} (torch sees {torch.cuda.device_count()} GPU)")
+print(f"Dataset cache:   {os.environ['HF_DATASETS_CACHE']}")
 
 print(f"\ntransformers: {transformers.__version__} ({transformers.__file__})")
 print(f"torch: {torch.__version__}")
@@ -61,9 +103,22 @@ else:
     else:
         print("No HF token found. Set HF_TOKEN or run `huggingface-cli login`.")
 
-# HF_DATASETS_CACHE was set in cell-2 (before importing datasets) to:
-#   /ssd1/zhuoyuan/speechQwen2VL/data
-# This ensures all downloaded data goes to the local SSD, not hf_cache.
+# %% [markdown]
+# ## 2. Download Dataset
+#
+# Downloads a subset of `speechbrain/LargeScaleASR`:
+# - **Train**: ~20 shards from `small/` split
+# - **Test**: 100 samples from `test/` split
+#
+# Audio column is cast to `decode=False` to keep raw bytes (needed by our `process_vision_info` pipeline).
+#
+# After loading, we pre-filter over-budget samples whose total token count would exceed `max_length=2048`.
+
+# %%
+# HF_DATASETS_CACHE was set in cell-2 to os.path.abspath("./data").
+# Since we os.chdir'd to the project root, this resolves to <project_root>/data.
+# On our server, ./data is a symlink to /ssd1, so data goes to the local SSD.
+# On other machines without the symlink, data goes to a local ./data folder.
 
 # The small/ split has 72 shards total (~107K samples). We use 20 shards (~30K samples)
 # following the skeleton notebook — sufficient for Stage 1 projector training.
@@ -93,6 +148,7 @@ print(f"Test samples:  {len(test_dataset)}")
 print(f"Dataset cache: {os.environ['HF_DATASETS_CACHE']}")
 print(f"Columns:       {train_dataset.column_names}")
 
+# %%
 # Pre-filter over-budget samples.
 # Total token budget per sample: audio_pads + transcript_tokens + template_overhead <= MAX_LENGTH
 #
@@ -148,6 +204,11 @@ print(f"Test:  {test_before} → {len(test_dataset)} (dropped {test_before - len
 
 del _processor, _tokenizer
 
+
+# %% [markdown]
+# ## 3. Memory Cleanup Utility
+
+# %%
 def clear_memory():
     """Clean up GPU memory by deleting common global variables and clearing CUDA cache."""
     for var_name in ['inputs', 'model', 'processor', 'trainer', 'peft_model', 'bnb_config']:
@@ -168,6 +229,13 @@ def clear_memory():
 
 print("clear_memory() defined.")
 
+# %% [markdown]
+# ## 4. Load Model & Processor, Freeze Parameters
+#
+# Load from HuggingFace in bf16, single GPU (no quantization for Stage 1).
+# Freeze everything, then unfreeze only `audio_projector`.
+
+# %%
 model = Qwen2VLForConditionalGeneration.from_pretrained(
     REPO_ID,
     torch_dtype=torch.bfloat16,
@@ -208,6 +276,31 @@ print("\nFreeze verification passed: only audio_projector is trainable.")
 if torch.cuda.is_available():
     print(f"\nGPU memory used: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
+
+# %% [markdown]
+# ## 5. Data Collator — `AudioTextCollator`
+#
+# Converts raw dataset samples into model-ready batches with masked labels.
+#
+# **Pipeline**: sample → conversation messages → `process_vision_info()` → chat template → processor → label masking
+#
+# **Label masking strategy**:
+# 1. Tokenize `<|im_start|>assistant\n` once in `__init__`, cache as token ID list
+# 2. Search each sequence's `input_ids` for this exact token subsequence
+# 3. Mask everything up to and including the match → -100
+# 4. Keep everything after (transcript + `<|im_end|>`) as real labels
+# 5. Mask padding tokens → -100
+#
+# ```
+# <|im_start|>system\n...<|im_end|>\n          → -100 (masked)
+# <|im_start|>user\n<|audio_start|>...<|im_end|> → -100 (masked)
+# <|im_start|>assistant\n                        → -100 (masked)
+# TRANSCRIPT TEXT                                → REAL LABELS
+# <|im_end|>                                     → REAL LABEL (stop token)
+# [padding]                                      → -100 (masked)
+# ```
+
+# %%
 class AudioTextCollator:
     """Collator that converts raw dataset samples into training batches with masked labels."""
 
@@ -343,6 +436,7 @@ class AudioTextCollator:
 
 collator = AudioTextCollator(processor)
 
+# %%
 # Test collator on a small batch
 test_batch = collator([train_dataset[0], train_dataset[1]])
 
@@ -380,10 +474,20 @@ for j in range(len(sample_labels)):
 
 del test_batch
 
+# %% [markdown]
+# ## 6. Training Config
+#
+# Using plain `Trainer` + `TrainingArguments` instead of SFTTrainer + SFTConfig.
+# SFTTrainer adds automatic dataset preprocessing (which we bypass — our AudioTextCollator handles it)
+# and token accuracy logging (which has a shape mismatch bug with gradient accumulation).
+# The core training (loss, backprop, optimizer) is identical.
+
+# %%
 training_args = TrainingArguments(
     output_dir="./checkpoints/stage1_audio_projector",
     num_train_epochs=3,
     per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,        # explicit — HF defaults to 8 which can OOM
     gradient_accumulation_steps=8,      # effective batch = 2 * 8 = 16
     learning_rate=1e-4,                 # higher than typical fine-tune (projector is random)
     weight_decay=0.01,
@@ -414,6 +518,10 @@ print(f"Learning rate:   {training_args.learning_rate}")
 print(f"Gradient ckpt:   {training_args.gradient_checkpointing}")
 print(f"Eval steps:      {training_args.eval_steps}")
 
+# %% [markdown]
+# ## 7. wandb Init
+
+# %%
 import wandb
 
 wandb.init(
@@ -431,21 +539,67 @@ wandb.init(
 )
 print("wandb initialized.")
 
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=test_dataset,
-    data_collator=collator,
-    processing_class=processor.tokenizer,
-)
+# %% [markdown]
+# ## 8. Train or Load Checkpoint
+#
+# **Option A**: Run `trainer.train()` below for single-GPU training (~7 hours).
+#
+# **Option B** (recommended): Run the multi-GPU DDP script instead:
+# ```bash
+# cd /home/zhuoyuan/projects/speechQwen2VL
+# python scripts/train_stage1.py              # auto-detect idle GPUs
+# python scripts/train_stage1.py --nproc 4    # limit to 4 GPUs
+# ```
+# Then skip the training cell and load the checkpoint in the next cell.
 
-print(f"Train dataset size: {len(train_dataset)}")
-print(f"Eval dataset size:  {len(test_dataset)}")
-print(f"Starting training...")
+# %%
+# Option A: Train from scratch (single GPU, ~7 hours)
+# Uncomment the lines below to train. Skip this cell if using DDP script.
 
-trainer.train()
+# trainer = Trainer(
+#     model=model,
+#     args=training_args,
+#     train_dataset=train_dataset,
+#     eval_dataset=test_dataset,
+#     data_collator=collator,
+#     processing_class=processor.tokenizer,
+# )
+# trainer.train()
 
+# %%
+# Option B: Load from a trained checkpoint (after DDP script finishes).
+# Trainer.save_model() saves the full 8.3B model, which HF shards into multiple
+# safetensor files. We use from_pretrained() to handle sharding automatically.
+
+import glob
+
+checkpoint_dir = "./checkpoints/stage1_audio_projector"
+
+# Find the latest checkpoint (highest step number), or use final saved model
+checkpoint_folders = sorted(glob.glob(os.path.join(checkpoint_dir, "checkpoint-*")))
+load_path = checkpoint_folders[-1] if checkpoint_folders else checkpoint_dir
+
+if os.path.exists(os.path.join(load_path, "config.json")):
+    print(f"Loading trained model from: {load_path}")
+    model = Qwen2VLForConditionalGeneration.from_pretrained(
+        load_path,
+        torch_dtype=torch.bfloat16,
+        device_map=DEVICE,
+    )
+    model.config.use_cache = False
+    print(f"Model loaded. GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+else:
+    print(f"No checkpoint found in {checkpoint_dir}. Train first!")
+
+
+# %% [markdown]
+# ## 9. Verify — Post-Training Inference
+#
+# Quick inference test to check that the trained projector produces coherent transcriptions
+# (should be much better than the garbage output from Notebook 04).
+# Run this **before** pushing to HuggingFace so we don't publish a bad checkpoint.
+
+# %%
 def run_inference(model, processor, messages, max_new_tokens=256):
     """Run inference on a single conversation (same as Notebook 04)."""
     image_inputs, video_inputs, audio_inputs = process_vision_info(messages)
@@ -473,6 +627,12 @@ def run_inference(model, processor, messages, max_new_tokens=256):
 
 print("run_inference() defined.")
 
+# %% [markdown]
+# ## 10. Push to HuggingFace & Cleanup
+#
+# Only 1 of 4 safetensor shards should change (the one containing `audio_projector` weights).
+
+# %%
 # Test on a few samples from the test set
 for idx in [0, 1, 2]:
     test_sample = test_dataset[idx]
@@ -493,10 +653,12 @@ for idx in [0, 1, 2]:
     print(f"Ground truth:  {test_sample['text']}")
     print()
 
+# %%
 model.push_to_hub(REPO_ID)
 processor.push_to_hub(REPO_ID)
 print(f"Model and processor pushed to {REPO_ID}")
 
+# %%
 wandb.finish()
 clear_memory()
 print("Training complete. Cleanup done.")

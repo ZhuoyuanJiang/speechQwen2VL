@@ -236,6 +236,62 @@ Additionally, `os.path.abspath("./data")` resolved relative to the notebook's wo
 - **`eval_steps`**: Changed from 100 to 500 (matching `save_steps`). Eval every 100 steps was too frequent — 55 evals × ~1-2 min each ≈ 15-25% of total training time wasted on eval.
 - **`batch_size`**: Tested `per_device_train_batch_size=4` with `gradient_accumulation_steps=4` (same effective batch=16). Result: slower (~10+ hours vs ~7 hours) because larger batches cause more padding waste. Reverted to batch_size=2, grad_accum=8.
 
+### 13. Portable paths via os.chdir + symlinks
+
+**Problem**: Notebook hardcoded `/ssd1/zhuoyuan/speechQwen2VL/data` for `HF_DATASETS_CACHE`. This breaks on any other machine.
+
+**Fix**: Notebook now does `os.chdir` to the project root at startup, then uses relative paths (`./data`, `./checkpoints`) everywhere. On our server, these are symlinks to SSD. On other machines without symlinks, they become regular local folders — everything still works.
+
+### VRAM usage summary
+
+All measurements on NVIDIA RTX 6000 Ada (49 GB each).
+
+| Setup | train_batch | eval_batch | GPUs | Peak VRAM (per GPU) | Notes |
+|---|---|---|---|---|---|
+| Single GPU, eval_batch=1 | 2 | 1 | 1 | ~26 GB | First successful eval run |
+| Single GPU, batch=4 | 4 | 4 | 1 | ~43 GB (43892 MiB) | Unclear if peak was during train or eval |
+| 8-GPU DataParallel (broken) | 2 | 2 | 8 | OOM on GPU 0 | All logits gathered to GPU 0 |
+| 6-GPU DDP (production) | 2 | 2 | 6 | 25-47 GB (varies) | Variable across GPUs due to different-length audio samples; GPU 7 peaked at 47265 MiB (96.2%) |
+
+**Key insight**: VRAM varies significantly across GPUs in DDP because audio samples have different durations → different sequence lengths → different activation sizes. The GPU that gets the longest samples in a batch uses the most memory.
+
+### 14. Multi-GPU DDP training script
+
+Created `scripts/train_stage1.py` — standalone training script converted from the notebook with DDP support.
+
+Features:
+- **Auto GPU detection**: finds idle GPUs and launches `torchrun` automatically
+- **`--nproc`** flag to limit number of GPUs
+- **`--num_evals`** (default 5): computes `eval_steps` and `save_steps` dynamically from total steps, plus a guaranteed final `trainer.evaluate()` after training
+- **`--eval_batch_size`** (default 2): decoupled from train batch size to avoid OOM during eval
+- **`--data_dir`, `--output_dir`, `--batch_size`, `--lr`, etc.** all configurable via CLI args
+- Same training logic as the notebook (collator, label masking, freeze strategy)
+
+Usage:
+```bash
+python scripts/train_stage1.py              # auto-detect all idle GPUs
+python scripts/train_stage1.py --nproc 4    # use at most 4 GPUs
+```
+
+**Current production run** (6 GPUs):
+- Effective batch size = 2/gpu × 8 accum × 6 GPUs = **96** (vs 16 on single GPU)
+- Total steps = 933 (vs 5,592 on single GPU)
+- ~5.8s/step, ETA ~1.5 hours
+- Note: the larger effective batch (96 vs 16) changes training dynamics — smoother gradients but fewer optimizer updates per epoch. Loss is dropping well (3.25 → 2.59 after 90 steps).
+- VRAM snapshot during training (varies per step due to different-length audio samples):
+  ```
+  GPU 0: 25863 / 49140 MiB
+  GPU 1: 41789 / 49140 MiB
+  GPU 2: 25843 / 49140 MiB
+  GPU 3: 35267 / 49140 MiB
+  GPU 6: 31739 / 49140 MiB
+  GPU 7: 47265 / 49140 MiB
+  ```
+
+### 15. Notebook checkpoint loading
+
+Added a "Load checkpoint" cell (Section 8, Option B) so that after the DDP script finishes training, the notebook can load the trained projector weights and run inference/push to HuggingFace without re-training.
+
 ---
 
 ## Dataset details
@@ -272,22 +328,36 @@ To use more data in the future (e.g., Stage 2), change the glob pattern:
 |---|---|---|---|
 | cell-2 (Section 1) | `from trl import SFTConfig, SFTTrainer` | `from transformers import Trainer, TrainingArguments` | SFTTrainer has accuracy computation bug with gradient accumulation |
 | cell-2 (Section 1) | Static GPU info print | `get_free_gpu()` → `GPU_ID`, `DEVICE`; set `CUDA_VISIBLE_DEVICES` | Auto-select idle GPU, restrict to single GPU so Trainer doesn't use DataParallel |
-| cell-2 (Section 1) | (no dataset cache config) | `os.environ["HF_DATASETS_CACHE"] = "/ssd1/zhuoyuan/speechQwen2VL/data"` before imports | Dataset arrow files go to local SSD, not hf_cache |
-| cell-4 (Section 2) | No `cache_dir` | Removed redundant cache config; added `DATA_DIR` print | Cache is set in cell-2; cell-4 just prints for verification |
+| cell-2 (Section 1) | (no chdir or cache config) | `os.chdir` to project root + `os.environ["HF_DATASETS_CACHE"] = os.path.abspath("./data")` before imports | Portable relative paths; dataset cache goes to `./data` (symlink to SSD on our server) |
+| cell-4 (Section 2) | No `cache_dir` | Removed redundant cache config; added cache path print | Cache is set in cell-2; cell-4 just prints for verification |
 | cell-9 (Section 4) | `device_map="cuda:0"` | `device_map=DEVICE` (`"cuda:0"` after CUDA_VISIBLE_DEVICES restriction) | Use auto-selected GPU |
 | cell-11 (Section 5) | Labels included trailing `\n` after `<\|im_end\|>` | Mask everything after `<\|im_end\|>` | Chat template adds `\n` after `<\|im_end\|>`; model should learn to stop at `<\|im_end\|>` |
 | cell-13 (Section 6) | Markdown: "SFTConfig" | Markdown: "TrainingArguments" + explanation of why we switched | Documentation |
-| cell-14 (Section 6) | `SFTConfig(... max_seq_length, dataset_text_field, dataset_kwargs ...)` | `TrainingArguments(...)` with `eval_steps=500` | Plain Trainer; eval every 500 steps (was 100, too frequent) |
+| cell-14 (Section 6) | `SFTConfig(... max_seq_length, dataset_text_field, dataset_kwargs ...)` | `TrainingArguments(...)` with `eval_steps=500` | Plain Trainer; notebook uses fixed eval_steps=500 for simplicity |
 | cell-16 (Section 7) | `sft_config.learning_rate` etc. | `training_args.learning_rate` etc. | Variable renamed |
-| cell-18 (Section 8) | `SFTTrainer(... args=sft_config ...)` | `Trainer(... args=training_args ...)` | Use plain Trainer |
+| cell-18 (Section 8) | `SFTTrainer(... args=sft_config ...)` | Training cell commented out (Option A); new checkpoint loading cell added (Option B) | Use DDP script for training, notebook for inference |
+
+---
+
+## New files
+
+| File | Description |
+|---|---|
+| `scripts/train_stage1.py` | Multi-GPU DDP training script. Auto-detects idle GPUs, launches torchrun. Dynamic eval schedule via `--num_evals` (default 5) + guaranteed final eval. CLI args for all config. |
+| `Documentation/Lessons/session5_QA.md` | Q&A: OOM causes, DDP, batch size, symlinks, training time, eval frequency |
+| `.conda_env` | Auto-activates `speech_qwen2vl` conda env when cd'ing into the project |
 
 ---
 
 ## Next steps
 
-1. Run full training (~7 hours on single GPU, 5,592 steps)
+1. Run DDP training (logs saved to `logs/` with timestamp):
+   ```bash
+   cd /home/zhuoyuan/projects/speechQwen2VL
+   python scripts/train_stage1.py 2>&1 | tee logs/train_stage1_$(date +%Y%m%d_%H%M%S).log
+   ```
+   Estimated ~1-2 hours with 6 GPUs.
 2. Monitor loss on wandb (project: `speechQwen2VL`, run: `stage1-audio-projector`)
-3. After training: run Section 9 (inference test) — should produce coherent transcription
+3. After training: load checkpoint in notebook, run Section 9 (inference test)
 4. If inference looks good: run Section 10 (push to HuggingFace `DanJZY/Qwen2-VL-7B-Speech`)
-5. Convert notebook to training script with multi-GPU DDP support (`torchrun`)
-6. Commit all changes
+5. Commit DDP script + notebook changes

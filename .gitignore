@@ -36,6 +36,9 @@ data/
 # HuggingFace cache
 .cache/
 
+# Logs
+logs/
+
 # OS
 .DS_Store
 Thumbs.db

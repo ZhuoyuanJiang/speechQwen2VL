@@ -20,9 +20,9 @@ The OOM happened during **evaluation**, not training. The difference:
 - **Training** uses `gradient_checkpointing`: doesn't store all layer activations, recomputes them during backward pass. Trades time for memory.
 - **Evaluation** does a full forward pass without gradient checkpointing: all intermediate activations stay in memory, plus the full logits tensor for computing eval loss.
 
-With `eval_batch_size=2`, the logits tensor alone is ~1.2 GB, and the uncompressed activations push total usage over 49 GB.
+With the HF default `eval_batch_size=8`, the logits tensor alone is ~4.8 GB, and the uncompressed activations push total usage well over 49 GB.
 
-**Fix**: Set `per_device_eval_batch_size=1`. This doesn't affect any metrics — eval loss is per-sample averaged regardless of batch size.
+**Fix**: Set `per_device_eval_batch_size=2` explicitly. HuggingFace defaults `per_device_eval_batch_size` to 8 (NOT to the train batch size), so you must set it yourself. With batch=2, total VRAM stays around 30-35 GB which fits in the 49 GB RTX 6000 Ada.
 
 ---
 
@@ -132,3 +132,33 @@ This is standard practice — notebooks for prototyping, scripts for training. T
 - **Training script** (`scripts/train_stage1.py`): Converted from the notebook. Supports multi-GPU DDP via `torchrun`. This is what goes in the README for others to reproduce training.
 
 The notebook is the "source of truth" for the training logic. The script is derived from it for production runs.
+
+---
+
+## Q: How do symlinks work for data/checkpoints? Will it break on another machine?
+
+**Context**: Our server has limited home directory quota (100GB on NAS), so large files (datasets, checkpoints) must go on local SSDs (`/ssd1/`). But we want `./data` and `./checkpoints` in the project directory for clean organization. The solution is symlinks — but this raised questions about portability and how paths should be written in code.
+
+**What is a symlink**: A tiny file (few bytes) that says "go look over there." When you write to `./data/file.txt` and `./data` is a symlink to `/ssd1/.../data/`, the filesystem follows the pointer and writes **directly** to `/ssd1/.../data/file.txt`. No data is stored at the symlink location; it all goes to the target.
+
+On our server:
+```
+./data        → /ssd1/zhuoyuan/speechQwen2VL/data/       (SSD)
+./checkpoints → /ssd1/zhuoyuan/speechQwen2VL/checkpoints/ (SSD)
+```
+
+On another machine without symlinks: `./data` and `./checkpoints` are just regular folders. Data downloads and checkpoints save locally. Everything still works — just stored in a different physical location.
+
+**Problem we hit**: Initially, the notebook hardcoded `/ssd1/zhuoyuan/speechQwen2VL/data` as the data path. This worked on our server but would break on any other machine. At the same time, using `./data` as a relative path failed because the notebook's working directory was `notebooks/`, so `./data` resolved to `notebooks/data/` (on the NAS, eating into home quota).
+
+| Path | How it was written | Portability |
+|---|---|---|
+| Checkpoints (script) | `./checkpoints/` (relative) | ✅ symlink → SSD; no symlink → local folder |
+| Data (notebook, old) | `/ssd1/zhuoyuan/...` (absolute) | ❌ breaks on other machines |
+| Data (script) | `--data_dir` CLI arg, default `./data` | ✅ others pass their own path |
+
+**Fix**: Notebook now does `os.chdir` to the project root at startup, then uses `os.path.abspath("./data")` for `HF_DATASETS_CACHE`. This way:
+- On our server: `./data` is the symlink → goes to SSD
+- On other machines: `./data` is a real folder → downloads locally
+
+**Lesson**: Use relative paths in code for portability. Handle the "notebook working directory ≠ project root" problem with `os.chdir` at startup, not by hardcoding absolute paths.
