@@ -162,3 +162,37 @@ On another machine without symlinks: `./data` and `./checkpoints` are just regul
 - On other machines: `./data` is a real folder → downloads locally
 
 **Lesson**: Use relative paths in code for portability. Handle the "notebook working directory ≠ project root" problem with `os.chdir` at startup, not by hardcoding absolute paths.
+
+---
+
+## Q: What does `save_model()` actually save? Just the projector or the full model?
+
+**Context**: We only trained the audio projector (~17M params, ~34 MB). But the checkpoint on disk is ~17 GB (4 sharded safetensor files). That seems wrong.
+
+**Answer**: HF Trainer's `save_model()` saves the **entire model** by default — all 8.3B parameters, including the frozen ones. It doesn't know which params were trainable; it just dumps everything. The frozen weights are byte-for-byte identical to the original HuggingFace checkpoint.
+
+**Trade-off**:
+- Full model save (~17 GB): convenient — `from_pretrained(checkpoint_dir)` gives you a ready-to-use model. No manual weight merging needed.
+- Projector-only save (~34 MB): `torch.save(model.model.audio_projector.state_dict(), "projector.pt")`. Much smaller, but loading requires first loading the base model, then manually loading the projector weights on top.
+
+**Lesson**: For Stage 1 where we're iterating quickly, full model saves are fine (disk is cheap on SSD). For distribution or HuggingFace upload, you'd push the full model anyway.
+
+---
+
+## Q: How do I interpret loss curves? When is training saturated?
+
+**Context**: Stage 1 ran for 933 steps (3 epochs). Train loss dropped from 3.25 to 0.15, eval loss from 0.31 to 0.22. But most of the drop happened in the first ~200 steps.
+
+**How to read it**:
+- **Train loss dropping, eval loss dropping**: model is learning and generalizing. Keep training.
+- **Train loss dropping, eval loss flat**: model is memorizing training data (overfitting). More training won't help generalization.
+- **Both flat**: saturated. Stop.
+
+**Our Stage 1 results**:
+- Steps 0-200: both train and eval loss drop steeply. Model is learning.
+- Steps 200-558: train loss 0.21→0.18, eval loss 0.31→0.23. Still some gains.
+- Steps 558-933: train loss 0.18→0.15, eval loss flat at 0.224. Overfitting — no generalization gain.
+
+**Conclusion**: 1-2 epochs would have been sufficient for Stage 1. The projector is a simple 2-layer MLP mapping between two embedding spaces — it doesn't need much data to converge. Future Stage 1 runs can use `--epochs 1`.
+
+**Lesson**: Always check if eval loss is still improving before adding more epochs. More training ≠ better model once eval loss plateaus.

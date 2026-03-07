@@ -227,18 +227,22 @@ The Session 5 plan anticipated this: "If SFTTrainer conflicts persist, fall back
 
 Additionally, `os.path.abspath("./data")` resolved relative to the notebook's working directory (`notebooks/`), not the project root — so data landed in `notebooks/data/` on the NAS home directory.
 
-**Fix**: Set `os.environ["HF_DATASETS_CACHE"]` at the very top of cell-2, before any imports, using an absolute path: `/ssd1/zhuoyuan/speechQwen2VL/data`.
+**Fix** (two iterations):
+1. *First attempt (non-portable)*: Hardcoded absolute path `/ssd1/zhuoyuan/speechQwen2VL/data`. Worked on our server but would break on any other machine.
+2. *Final fix (portable)*: Notebook does `os.chdir` to project root at startup, then uses `os.path.abspath("./data")` for `HF_DATASETS_CACHE`. On our server `./data` is a symlink → SSD. On other machines it becomes a regular local folder. See section 13 below for full details.
+
+The key insight is that `HF_DATASETS_CACHE` must be set **before** `from datasets import ...` — the library reads its cache path at import time.
 
 **Note on HF's two-layer cache**: `HF_DATASETS_CACHE` only controls processed arrow files (what training reads). Raw parquet downloads always go to `HF_HOME/hub/` — this is by HF's design and not configurable separately without changing `HF_HOME`. Both are on the local SSD, so this is fine.
 
 ### 12. Training config adjustments
 
-- **`eval_steps`**: Changed from 100 to 500 (matching `save_steps`). Eval every 100 steps was too frequent — 55 evals × ~1-2 min each ≈ 15-25% of total training time wasted on eval.
+- **`eval_steps`**: Changed from 100 to 500 (matching `save_steps`). Eval every 100 steps was too frequent — 55 evals × ~1-2 min each ≈ 15-25% of total training time wasted on eval. Later replaced with dynamic `--num_evals` in the DDP script (see section 14).
 - **`batch_size`**: Tested `per_device_train_batch_size=4` with `gradient_accumulation_steps=4` (same effective batch=16). Result: slower (~10+ hours vs ~7 hours) because larger batches cause more padding waste. Reverted to batch_size=2, grad_accum=8.
 
 ### 13. Portable paths via os.chdir + symlinks
 
-**Problem**: Notebook hardcoded `/ssd1/zhuoyuan/speechQwen2VL/data` for `HF_DATASETS_CACHE`. This breaks on any other machine.
+**Problem**: The first cache fix (section 11) hardcoded `/ssd1/zhuoyuan/speechQwen2VL/data`, which breaks on other machines.
 
 **Fix**: Notebook now does `os.chdir` to the project root at startup, then uses relative paths (`./data`, `./checkpoints`) everywhere. On our server, these are symlinks to SSD. On other machines without symlinks, they become regular local folders — everything still works.
 
@@ -349,15 +353,65 @@ To use more data in the future (e.g., Stage 2), change the glob pattern:
 
 ---
 
+## Stage 1 Training Results
+
+### Run config
+- **GPUs**: 6× RTX 6000 Ada (49 GB each)
+- **Effective batch size**: 2/gpu × 8 accum × 6 GPUs = 96
+- **Total steps**: 933 (3 epochs, ~29K training samples after filtering)
+- **Training time**: 1h 34m (~5.9s/step)
+- **Eval schedule**: 5 evenly-spaced evals (steps 186, 372, 558, 744, 930) + final eval after training
+
+### Loss curve
+
+**Training loss** (logged every 10 steps):
+```
+Steps 10-120:   3.25 → 2.50  (steep drop — learning basic audio→text mapping)
+Steps 130-150:  2.50 → 0.39  (massive drop — projector "clicks")
+Steps 160-200:  0.39 → 0.21  (rapid refinement)
+Steps 200-300:  0.21 → 0.18  (slowing down)
+Steps 300-933:  0.18 → 0.15  (barely moving — saturated)
+```
+
+**Eval loss** (5 evals + final):
+```
+Step 186:  0.310
+Step 372:  0.242
+Step 558:  0.227
+Step 744:  0.224
+Step 930:  0.224  (flat after step 558)
+Final:     0.224
+```
+
+**Interpretation**: Training is effectively saturated after ~200-300 steps (~1 epoch). Epochs 2-3 squeeze train loss from 0.18 → 0.15 but eval loss is flat (0.227 → 0.224), indicating mild overfitting without generalization gains. For future Stage 1 runs, 1-2 epochs would be sufficient.
+
+### Checkpoint details
+
+`trainer.save_model()` saves the **entire model** (~17 GB, 4 sharded safetensor files), not just the trained projector weights (~34 MB). The frozen weights are identical to the original HuggingFace checkpoint, but HF saves everything by default. This is convenient for loading (just `from_pretrained(checkpoint_dir)`) but wasteful on disk.
+
+To save only the projector:
+```python
+torch.save(model.model.audio_projector.state_dict(), "projector.pt")  # ~34 MB
+```
+
+Checkpoint directory structure (`./checkpoints/stage1_audio_projector/`):
+- `checkpoint-744/`, `checkpoint-930/`, `checkpoint-933/` — intermediate checkpoints (kept 3 due to `save_total_limit=3`)
+- Root: `model-0000{1..4}-of-00004.safetensors`, `config.json`, tokenizer files — final model from `trainer.save_model()`
+
+The `save_total_limit=3` means earlier checkpoints (steps 186, 372, 558) were automatically deleted as newer ones were saved.
+
+### Inference verification
+
+Loaded the final checkpoint and ran inference on 3 test samples (Section 9 of the notebook). All 3 produced **exact-match transcriptions**, including complex words like "autochthonous." See the output cells in `notebooks/05_training_stage1_adapter.ipynb` Section 9 for full results.
+
+**Limitations**: This is a qualitative spot-check (3 samples), not a rigorous evaluation. A WER/CER pass on the full test set would be more thorough. For Stage 1's purpose (verify projector maps audio→text correctly), 3 exact matches is a strong signal.
+
+**Known polish debt**: The saved checkpoint's `generation_config.json` still contains sampling defaults (`temperature`, `top_p`, `top_k`) even though we use greedy decoding (`do_sample=False`). This causes a harmless warning during inference. Should be cleaned up before pushing to HuggingFace Hub.
+
+---
+
 ## Next steps
 
-1. Run DDP training (logs saved to `logs/` with timestamp):
-   ```bash
-   cd /home/zhuoyuan/projects/speechQwen2VL
-   python scripts/train_stage1.py 2>&1 | tee logs/train_stage1_$(date +%Y%m%d_%H%M%S).log
-   ```
-   Estimated ~1-2 hours with 6 GPUs.
-2. Monitor loss on wandb (project: `speechQwen2VL`, run: `stage1-audio-projector`)
-3. After training: load checkpoint in notebook, run Section 9 (inference test)
-4. If inference looks good: run Section 10 (push to HuggingFace `DanJZY/Qwen2-VL-7B-Speech`)
-5. Commit DDP script + notebook changes
+1. ~~Push trained model to HuggingFace~~ ✅ Done — pushed to `DanJZY/Qwen2-VL-7B-Speech`
+2. (Optional) Clean `generation_config.json` on HuggingFace to suppress harmless sampling warning
+3. Begin Stage 2 planning (Notebook 06 scaffolding)
