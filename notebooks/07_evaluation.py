@@ -445,6 +445,25 @@ for r in sorted_results[:10]:
     print()
 
 # %%
+# Extract worst-performing samples as .wav files for manual inspection   
+# the code saves 10 .wav files to ./checkpoints/worst_samples/ — one per worst prediction. You can play them in any audio player.                                         
+import os                                                                                                       
+worst_dir = "./checkpoints/worst_samples"
+os.makedirs(worst_dir, exist_ok=True)
+
+worst_indices = [r["index"] for r in sorted_results[:10]]
+for idx in worst_indices:
+    sample = test_dataset[idx]
+    audio_bytes = sample["wav"]["bytes"]
+    r = sorted_results[worst_indices.index(idx)]
+    filename = f"sample_{idx}_wer{r['wer']:.0%}.wav".replace("%", "pct")
+    filepath = os.path.join(worst_dir, filename)
+    with open(filepath, "wb") as f:
+        f.write(audio_bytes)
+
+print(f"Saved {len(worst_indices)} audio files to {worst_dir}/")
+
+# %%
 # WER distribution histogram
 import matplotlib.pyplot as plt
 
@@ -471,6 +490,22 @@ plt.tight_layout()
 plt.savefig("./checkpoints/wer_distribution.png", dpi=150)
 plt.show()
 print("Saved WER distribution plot to ./checkpoints/wer_distribution.png")
+
+# %% [markdown]
+# ### WER Distribution Analysis                                                                                     
+#                                                                                                                 
+# The histograms confirm Stage 2 is substantially better across the board, with a small pathological tail:          
+#                 
+# | Metric | Stage 1 | Stage 2 |
+# |--------|---------|---------|
+# | Exact-match rate (WER=0%) | 35.1% | 45.6% |
+# | Median WER | 7.7% | 4.0% |
+# | Samples with WER > 100% | 72 | 34 |
+# | Samples hitting 256-token cap | 14 | 3 |
+#
+# The bulk of the distribution shifted left (lower WER) after LoRA fine-tuning. The long tail of WER > 100% samples
+# halved, and the hard cap-hit loops (the worst autoregressive failures) dropped from 14 to 3. This is a good model
+# with a few ugly tail failures — not a systemic issue.
 
 # %% [markdown]
 # ## 8. Breakdown by Duration
@@ -553,3 +588,88 @@ for name in ["model_s1", "model", "base_model"]:
 gc.collect()
 torch.cuda.empty_cache()
 print("Evaluation complete. Cleanup done.")
+
+# %%
+# Quick test: re-run the 10 worst samples with repetition_penalty=1.2
+# Compare old (greedy) vs new (with penalty) predictions.
+
+# Load Stage 2 model if not already in memory
+try:
+    model
+except NameError:
+    print("Loading Stage 2 model...")
+    base_model = Qwen2VLForConditionalGeneration.from_pretrained(
+        STAGE1_REPO, torch_dtype=torch.bfloat16, device_map=DEVICE,
+    )
+    base_model.config.use_cache = True
+    model = PeftModel.from_pretrained(base_model, LORA_REPO)
+    model.eval()
+    processor = Qwen2VLProcessor.from_pretrained(STAGE1_REPO)
+    print(f"Loaded. GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+
+# The 10 worst sample indices (from sorted_results)
+worst_indices = [r["index"] for r in sorted(results_s2, key=lambda x: x["wer"], reverse=True)[:10]]
+
+print("=" * 80)
+print(f"Testing repetition_penalty=1.2 on {len(worst_indices)} worst samples")
+print("=" * 80)
+
+for idx in worst_indices:
+    sample = test_dataset[idx]
+    messages = [
+        {"role": "user", "content": [
+            {"type": "audio", "audio": sample["wav"]["bytes"]},
+            {"type": "text", "text": "Transcribe this audio."},
+        ]},
+    ]
+
+    # Run with repetition_penalty
+    image_inputs, video_inputs, audio_inputs = process_vision_info(messages)
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    batch = processor(text=[text], audios=audio_inputs, return_tensors="pt", padding=True)
+    batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+    with torch.inference_mode():
+        output_ids = model.generate(
+            **batch, max_new_tokens=256, num_beams=1, do_sample=False,
+            repetition_penalty=1.2,
+        )
+    prompt_len = batch["input_ids"].shape[1]
+    new_pred = processor.batch_decode(output_ids[:, prompt_len:], skip_special_tokens=True)[0]
+
+    # Look up old prediction
+    old_entry = next(r for r in results_s2 if r["index"] == idx)
+    old_pred = old_entry.get("prediction_raw", old_entry["prediction"])
+    ref = old_entry.get("reference_raw", old_entry["reference"])
+
+    new_wer = wer(normalize_text(ref), normalize_text(new_pred)) if normalize_text(ref) else float("inf")
+
+    print(f"\nSample {idx} (duration={old_entry['duration']:.1f}s)")                                              
+    print(f"  REF:     {ref}")
+    print(f"  OLD HYP: {old_pred}")                                                                               
+    print(f"  NEW HYP: {new_pred}")                                                                             
+    print(f"  WER:     {old_entry['wer']:.0%} → {new_wer:.0%}")
+
+# %% [markdown]
+# ### Error Analysis
+#                                                                                                                 
+# **Failure categories** from the 10 worst Stage 2 predictions:                                                   
+#
+# 1. **Repetition loops** (Samples 414, 7512): Model transcribes correctly but fails to emit `<|im_end|>`, getting
+# stuck in a loop. Root cause is train/inference mismatch (exposure bias) — during training the model sees correct
+# previous tokens, but at inference it conditions on its own outputs. Only 3/8,087 Stage 2 predictions hit the
+# 256-token cap (vs 14/8,087 in Stage 1).
+#
+# 2. **Incomplete references** (Samples 8025, 6376, 540, 4216, 2352): The model transcribes *more* speech than the
+# reference captures. On manual listening, the audio genuinely contains repeated or additional speech — the model is
+# more correct than the ground truth. These are dataset quality issues, not model failures.
+#
+# 3. **Non-English audio** (Samples 4317, 5216): French/German audio mislabeled as English. Out-of-distribution for
+# our English-trained model.
+#
+# 4. **Word boundary differences** (Sample 3228): "GREENHORNS" → "GREEN HORNS" — semantically identical, WER metric
+# artifact.
+#
+# **Decoding fix tested**: `repetition_penalty=1.2` eliminated the loop in Sample 414 (713% → 40% WER) and helped
+# Sample 7512 (513% → 97%). Non-repetition samples were unaffected. For production use, `repetition_penalty=1.1` +
+# `num_beams=2` is the recommended decoding configuration. See `Documentation/Lessons/session7_QA.md` for full
+# analysis.

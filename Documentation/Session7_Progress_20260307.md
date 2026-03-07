@@ -281,6 +281,45 @@ Previous notebooks (05/06) only used 100 test samples (first 100 from 1 shard) f
 | `scripts/evaluate.py` | Standalone CLI evaluation script (single GPU) |
 | `Documentation/Session7_Plan.md` | Evaluation plan |
 | `Documentation/Session7_Progress_20260307.md` | This file |
+| `Documentation/Lessons/session7_QA.md` | Error analysis Q&A: failure categories, repetition degeneration, decoding fixes |
+| `scripts/extract_worst_samples.py` | Extracts audio .wav files for the 10 worst-performing samples |
+
+---
+
+## Error Analysis
+
+After inspecting the 10 worst predictions and listening to extracted audio samples, we identified 4 failure categories:
+
+| Category | Samples | Cause | Model at fault? |
+|----------|---------|-------|-----------------|
+| Repetition loops | 414, 7512 | Model fails to emit `<\|im_end\|>`, greedy decoding loops | Yes — decoding pathology |
+| Incomplete references | 8025, 6376, 540, 4216, 2352 | Audio contains more speech than the reference captures | No — model is more correct |
+| Non-English audio | 4317, 5216 | French/German audio mislabeled as English | No — dataset quality issue |
+| Word boundary differences | 3228 | "GREENHORNS" → "GREEN HORNS" | No — WER metric artifact |
+
+**Key finding**: Most "worst" predictions are actually dataset quality issues, not model failures. Only 2 out of 10 are genuine model errors (repetition loops), and those are a decoding pathology, not a model quality issue.
+
+### WER Distribution
+
+| Metric | Stage 1 | Stage 2 |
+|--------|---------|---------|
+| Exact-match rate (WER=0%) | 35.1% | 45.6% |
+| Median WER | 7.7% | 4.0% |
+| Samples with WER > 100% | 72 | 34 |
+| Samples hitting 256-token cap | 14 | 3 |
+
+### Repetition penalty test
+
+Tested `repetition_penalty=1.2` on the 10 worst samples:
+
+| Sample | Old WER | New WER | Notes |
+|--------|---------|---------|-------|
+| 414 | 713% | 40% | "AH" loop eliminated |
+| 7512 | 513% | 97% | Loop broken, still wrong content |
+| 4216 | 175% | 150% | Slight improvement |
+| Others | — | — | No change (not repetition issues) |
+
+See `Documentation/Lessons/session7_QA.md` for full analysis including root cause (exposure bias), decoding mitigations, and training recommendations.
 
 ---
 
@@ -302,6 +341,9 @@ Five issues were identified during code review and fixed before running evaluati
 
 ## Next Steps
 
-1. Commit evaluation notebook, CLI script, and documentation
-2. (Optional) Analyze duration breakdown and worst predictions for error patterns
-3. (Optional) Run custom audio inference on external `.wav` files
+1. ~~Commit evaluation notebook, CLI script, and documentation~~ ✅ Done
+2. ~~Analyze worst predictions and error patterns~~ ✅ Done — see Error Analysis section above
+3. (Optional) Re-evaluate full test set with `repetition_penalty=1.1` + `num_beams=2` to get updated corpus WER/CER
+4. (Optional) Analyze duration breakdown for per-bucket WER/CER patterns
+5. (Optional) Run custom audio inference on external `.wav` files
+6. (Optional, next training run) Use `load_best_model_at_end=True`, early stopping, and 1.8-2.0 epochs to preserve best checkpoint
