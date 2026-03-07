@@ -278,7 +278,7 @@ checkpoint_folders = sorted(
 
 ---
 
-## Stage 2 Training Run #1 (in progress)
+## Stage 2 Training Run #1
 
 ### Config
 
@@ -347,19 +347,52 @@ Stage 2 uses slightly more VRAM due to 10x more optimizer states (178M vs 17M tr
 
 ---
 
+## Stage 2 Training Results
+
+### Run summary
+- **Training time**: 5h 40m (3354 steps, 3 epochs)
+- **Final train loss**: 0.141
+- **Best eval loss**: 0.164 (epoch ~1.8) — **27% improvement** over Stage 1's final 0.224
+- **Final eval loss**: 0.170 (mild overfitting after epoch ~1.8)
+- **wandb**: https://wandb.ai/zhuoyuan-jiang-yale-yale-university/speechQwen2VL/runs/xd6lqrdo
+
+### Eval loss progression
+```
+Epoch 0.3:  0.195   (already better than Stage 1's 0.224)
+Epoch 0.6:  0.183
+Epoch 0.9:  0.173
+Epoch 1.2:  0.168
+Epoch 1.5:  0.167
+Epoch 1.8:  0.164   ← best
+Epoch 2.1:  0.167   ← overfitting begins
+Epoch 2.4:  0.169
+Epoch 2.7:  0.169
+Epoch 3.0:  0.170
+```
+
+### Saved checkpoints
+`save_total_limit=3` kept only checkpoints 3015, 3350, 3354. The best checkpoint (around step ~2010, epoch 1.8) was already deleted. The root-level `adapter_model.safetensors` (680 MB) is the final model from step 3354.
+
+For future runs: increase `save_total_limit` or add early stopping to preserve the best checkpoint.
+
+### Inference verification
+Loaded the final checkpoint (Section 8 Option B) and ran inference (Section 10). Transcriptions look good — quality improvement over Stage 1 confirmed.
+
+### Overfitting analysis
+Overfitting is mild (0.164 → 0.170, only 3.6% relative increase). For future runs, 1-2 epochs would be optimal. The improvement over Stage 1 (0.224 → 0.170 = 24% reduction) is substantial regardless.
+
+---
+
 ## Commits
 
 1. **Stage 1 DDP fixes + docs** — Dynamic `--num_evals`, `--eval_batch_size`, notebook .py sync via jupytext
 2. **Session 6 plan + Q&A** — `Documentation/Session6_Plan.md`, `Documentation/Lessons/session6_QA.md`
-3. **Notebook 06 + DDP script** — (pending commit, waiting for training validation)
+3. **Notebook 06 + DDP script + start training** — Stage 2 LoRA notebook, DDP script, progress docs
 
 ---
 
 ## Next Steps
 
-1. Monitor Stage 2 training loss and eval loss on wandb
-2. After training: load checkpoint in notebook Section 8 Option B, run inference in Section 10
-3. Compare transcription quality vs Stage 1
-4. If results are good: push LoRA adapters to `DanJZY/Qwen2-VL-7B-Speech-LoRA` (Section 9)
-5. Commit notebook + DDP script
-6. Consider whether to train longer (more epochs) or with different hyperparameters based on loss curves
+1. ~~Push LoRA adapters to HuggingFace~~ ✅ Done — pushed to `DanJZY/Qwen2-VL-7B-Speech-LoRA`
+2. (Optional) Add early stopping callback for future runs
+3. (Optional) Consider retraining with 1-2 epochs to avoid overfitting — current results are good

@@ -5,8 +5,9 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
+#       jupytext_version: 1.19.1
 #   kernelspec:
-#     display_name: Python 3
+#     display_name: speech_qwen2vl
 #     language: python
 #     name: python3
 # ---
@@ -589,15 +590,15 @@ for idx in [0, 1, 2]:
 # (~700MB), not the full base model. Push to a separate repo.
 
 # %%
-ADAPTER_REPO = "DanJZY/Qwen2-VL-7B-Speech-LoRA"
+# ADAPTER_REPO = "DanJZY/Qwen2-VL-7B-Speech-LoRA"
 
-model.save_pretrained("./checkpoints/stage2_lora")
-processor.save_pretrained("./checkpoints/stage2_lora")
-print(f"LoRA adapter saved to ./checkpoints/stage2_lora")
+# model.save_pretrained("./checkpoints/stage2_lora")
+# processor.save_pretrained("./checkpoints/stage2_lora")
+# print(f"LoRA adapter saved to ./checkpoints/stage2_lora")
 
-model.push_to_hub(ADAPTER_REPO)
-processor.push_to_hub(ADAPTER_REPO)
-print(f"LoRA adapter pushed to {ADAPTER_REPO}")
+# model.push_to_hub(ADAPTER_REPO)
+# processor.push_to_hub(ADAPTER_REPO)
+# print(f"LoRA adapter pushed to {ADAPTER_REPO}")
 
 # %% [markdown]
 # ## 11. Cleanup
