@@ -310,7 +310,7 @@ We use the `small` config, but **not all of it**:
 |---|---|---|
 | `small/` split total | 72 shards | ~107K (estimated) |
 | **What we download** | 20 shards | **29,820** |
-| `test/` split total | 6 shards | ~1,348 |
+| `test/` split total | 6 shards | **8,087** |
 | **What we use for eval** | 1 shard, first 100 | **100** |
 
 The `data_files` glob patterns select specific shards:
