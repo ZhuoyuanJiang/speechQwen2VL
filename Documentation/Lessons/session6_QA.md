@@ -55,3 +55,35 @@ The audio projector stays trainable as full parameters (not LoRA) via PEFT's `mo
 **Recommendation**: On our 49 GB GPUs, plain LoRA is preferred — faster training, simpler code, no quantization risks. QLoRA is the fallback if we need more VRAM (e.g., larger batches, longer sequences, or running on smaller GPUs).
 
 **Lesson**: QLoRA exists to make fine-tuning fit on smaller GPUs. If you have enough VRAM for bf16, plain LoRA is strictly better — same adapters, faster training, higher precision.
+
+---
+
+## Q: Why do GPUs have very different VRAM usage during DDP training?
+
+**Context**: During Stage 2 training with 6 GPUs, we observed highly uneven memory usage — some GPUs at ~30 GB while others hit ~45 GB. All GPUs run the same model with the same batch size. Why the difference?
+
+**Observed VRAM** (6 DDP ranks, same step):
+```
+GPU 0: 29.8 GB   GPU 1: 30.4 GB   GPU 2: 35.3 GB
+GPU 3: 36.1 GB   GPU 6: 42.0 GB   GPU 7: 45.0 GB
+```
+
+**Answer**: Three factors combine to cause this:
+
+1. **DDP splits by index, not by length**: `DistributedSampler` assigns samples to GPUs by index (GPU 0 gets samples 0, 6, 12...; GPU 1 gets 1, 7, 13...). It does **not** balance by audio duration. Some GPUs end up with more long clips than others.
+
+2. **Padding to max length within each GPU's batch**: Each GPU independently pads its batch to the length of its longest sample. If GPU 6 gets two 25-second clips while GPU 0 gets two 5-second clips, GPU 6's input tensors are ~5x larger.
+
+3. **Activations scale with sequence length**: The forward pass through 8.3B params produces intermediate activations proportional to sequence length. Even with gradient checkpointing (which only stores activations at checkpoint boundaries), longer sequences = more memory for the currently-computed layers.
+
+**Why some GPUs stay high**: Two possible reasons:
+1. **Sampling luck**: `DistributedSampler` shuffles once per epoch, so a GPU assigned more long-duration samples will hit higher peaks more often throughout the epoch.
+2. **CUDA caching allocator**: PyTorch's memory allocator reserves memory at peak usage and does **not** release it back to the OS. A GPU that processes one long batch will show high `nvidia-smi` usage even after subsequent shorter batches — the allocator holds the memory for future allocations. So a persistent 45 GB reading may reflect a past spike's high-water mark, not ongoing high usage.
+
+In practice, both factors likely contribute. `nvidia-smi` reports the allocator's reserved memory, not necessarily what's actively in use.
+
+**Why we also see transient spikes**: Within a single GPU's assigned samples, some batches happen to contain longer clips than others. GPU 3 spiked from ~30 GB to 44 GB on one step, then dropped back — it hit a batch with unusually long samples, then the next batch was shorter.
+
+**Is this a problem?**: Not usually. The worst case is if the unluckiest GPU hits a long batch during evaluation (when gradient checkpointing is off). With `eval_batch_size=2` and only 100 eval samples, this hasn't caused OOM in practice. But it's worth monitoring the first eval to confirm.
+
+**Lesson**: Variable-length data (audio, text) causes uneven GPU memory in DDP. The imbalance is structural (per-epoch sampling) plus stochastic (per-batch variation). If VRAM is tight, consider length-based batch sampling or reducing max sequence length to cap the worst case.
