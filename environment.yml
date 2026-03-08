@@ -18,7 +18,7 @@ dependencies:
   - python=3.10.18
   - cuda-toolkit=12.1.1
   # Audio system libraries (conda-forge)
-  - ffmpeg
-  - libsndfile
+  - ffmpeg=8.0.1
+  - libsndfile=1.2.2
   - pip:
       - -r requirements.txt
