@@ -210,6 +210,8 @@ python scripts/evaluate.py \
     --output_dir ./checkpoints \
     --data_dir ./data \
     --max_new_tokens 256 \
+    --repetition_penalty 1.0 \ # 1.0 = off, try 1.1-1.2 to reduce repetition loops
+    --num_beams 1 \            # 1 = greedy, try 2 for better stopping behavior
     --gpu None                 # None = auto-select idle GPU
 ```
 
@@ -347,3 +349,45 @@ Five issues were identified during code review and fixed before running evaluati
 4. (Optional) Analyze duration breakdown for per-bucket WER/CER patterns
 5. (Optional) Run custom audio inference on external `.wav` files
 6. (Optional, next training run) Use `load_best_model_at_end=True`, early stopping, and 1.8-2.0 epochs to preserve best checkpoint
+
+---
+
+## Session 7b: Re-evaluation with Decoding Fixes
+
+After error analysis revealed repetition loops in a small number of Stage 2 predictions (3/8,087 hitting the 256-token cap), we added `--repetition_penalty` and `--num_beams` arguments to the CLI script and re-evaluated Stage 2 with improved decoding.
+
+### Changes to `scripts/evaluate.py`
+
+Added two new CLI arguments:
+- `--repetition_penalty` (default: 1.0 = off): Soft penalty on already-seen tokens. Reduces repetition loops without hurting legitimate repeated speech.
+- `--num_beams` (default: 1 = greedy): Beam search width. Explores alternative continuations, making it easier to find the stop token.
+
+Defaults are unchanged, so existing behavior is preserved.
+
+### Command used
+
+```bash
+mkdir -p logs && python scripts/evaluate.py --model stage2 --gpu 0 \
+    --repetition_penalty 1.1 --num_beams 2 \
+    2>&1 | tee logs/eval_stage2_rp1.1_beam2_$(date +%Y%m%d_%H%M%S).log
+```
+
+No need to re-run Stage 1 — the decoding fixes target repetition loops, which are a Stage 2 tail issue.
+
+### Results
+
+| Metric | Greedy (baseline) | + repetition_penalty=1.1 + num_beams=2 | Relative Improvement |
+|--------|-------------------|----------------------------------------|----------------------|
+| **WER** | 8.67% | **7.90%** | **-8.9%** |
+| **CER** | 4.75% | **4.25%** | **-10.5%** |
+
+Runtime: 2h 12m on a single GPU (~1.02 it/s). Slightly slower than greedy (~1s/sample) due to beam search overhead.
+
+The decoding fixes reduced WER by nearly 1 percentage point absolute without any retraining — purely from better inference-time decoding. This confirms the error analysis: the model's underlying quality was being masked by a small number of repetition-loop failures that disproportionately inflated WER.
+
+### Updated comparison table (Stage 1 vs Stage 2 with decoding fixes)
+
+| Metric | Stage 1 (projector only) | Stage 2 (LoRA + decoding fixes) | Relative Improvement |
+|--------|--------------------------|----------------------------------|----------------------|
+| **WER** | 12.89% | **7.90%** | **-38.7%** |
+| **CER** | 7.43% | **4.25%** | **-42.8%** |

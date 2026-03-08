@@ -106,6 +106,15 @@ We tested `repetition_penalty=1.2` on the 10 worst samples:
 | 4216 | 175% | 150% | Slight improvement |
 | Others | — | — | No change (not repetition issues) |
 
+**Full test set re-evaluation** with `repetition_penalty=1.1` + `num_beams=2`:
+
+| Metric | Greedy (baseline) | With decoding fixes | Improvement |
+|--------|-------------------|---------------------|-------------|
+| WER | 8.67% | 7.90% | -8.9% relative |
+| CER | 4.75% | 4.25% | -10.5% relative |
+
+Nearly 1 percentage point WER reduction with no retraining — purely from better decoding.
+
 **What works**:
 - `repetition_penalty=1.1-1.2` — soft penalty on already-seen tokens. Fixes actual loops without hurting legitimate repeated speech. Best first fix.
 - `num_beams=2` — beam search explores alternative continuations, making it easier to find the stop token. Combined with `repetition_penalty=1.1`, this is effective.

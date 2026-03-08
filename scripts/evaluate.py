@@ -9,6 +9,7 @@ Usage:
     python scripts/evaluate.py                              # Stage 2, full test set
     python scripts/evaluate.py --model both --n_samples 100 # Compare both, quick
     python scripts/evaluate.py --model stage1               # Stage 1 only
+    python scripts/evaluate.py --repetition_penalty 1.1 --num_beams 2  # With decoding fixes
 """
 
 import os
@@ -35,6 +36,10 @@ parser.add_argument("--output_dir", type=str, default="./checkpoints",
 parser.add_argument("--data_dir", type=str, default="./data",
                     help="Dataset cache directory (default: ./data)")
 parser.add_argument("--max_new_tokens", type=int, default=256)
+parser.add_argument("--repetition_penalty", type=float, default=1.0,
+                    help="Repetition penalty for decoding (default: 1.0 = off, try 1.1-1.2 to reduce loops)")
+parser.add_argument("--num_beams", type=int, default=1,
+                    help="Beam search width (default: 1 = greedy, try 2 for better stopping)")
 parser.add_argument("--gpu", type=int, default=None,
                     help="GPU index (default: auto-select)")
 
@@ -90,7 +95,8 @@ LORA_REPO = "DanJZY/Qwen2-VL-7B-Speech-LoRA"
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
-def run_inference(model, processor, messages, max_new_tokens=256):
+def run_inference(model, processor, messages, max_new_tokens=256,
+                  repetition_penalty=1.0, num_beams=1):
     """Run inference on a single conversation."""
     image_inputs, video_inputs, audio_inputs = process_vision_info(messages)
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -104,13 +110,11 @@ def run_inference(model, processor, messages, max_new_tokens=256):
     )
     batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
     model.eval()
+    gen_kwargs = dict(max_new_tokens=max_new_tokens, num_beams=num_beams, do_sample=False)
+    if repetition_penalty != 1.0:
+        gen_kwargs["repetition_penalty"] = repetition_penalty
     with torch.inference_mode():
-        output_ids = model.generate(
-            **batch,
-            max_new_tokens=max_new_tokens,
-            num_beams=1,
-            do_sample=False,
-        )
+        output_ids = model.generate(**batch, **gen_kwargs)
     prompt_len = batch["input_ids"].shape[1]
     generated_ids = output_ids[:, prompt_len:]
     return processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
@@ -126,7 +130,8 @@ def normalize_text(text):
     return text
 
 
-def evaluate_model(model, processor, dataset, model_name, max_new_tokens=256):
+def evaluate_model(model, processor, dataset, model_name, max_new_tokens=256,
+                   repetition_penalty=1.0, num_beams=1):
     """Run inference on dataset, compute WER/CER, return summary and per-sample results."""
     predictions = []
     references = []
@@ -141,7 +146,8 @@ def evaluate_model(model, processor, dataset, model_name, max_new_tokens=256):
             ]},
         ]
 
-        pred = run_inference(model, processor, messages, max_new_tokens=max_new_tokens)
+        pred = run_inference(model, processor, messages, max_new_tokens=max_new_tokens,
+                            repetition_penalty=repetition_penalty, num_beams=num_beams)
         ref = sample["text"]
 
         pred_norm = normalize_text(pred)
@@ -247,7 +253,8 @@ if args.model in ("stage2", "both"):
     print(f"GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
     summary_s2, results_s2 = evaluate_model(
-        model, processor, test_dataset, "stage2_lora", args.max_new_tokens
+        model, processor, test_dataset, "stage2_lora", args.max_new_tokens,
+        args.repetition_penalty, args.num_beams
     )
     print_summary(summary_s2)
     save_results(summary_s2, results_s2, args.output_dir, "stage2_lora")
@@ -268,7 +275,8 @@ if args.model in ("stage1", "both"):
     print(f"GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
     summary_s1, results_s1 = evaluate_model(
-        model, processor, test_dataset, "stage1_projector", args.max_new_tokens
+        model, processor, test_dataset, "stage1_projector", args.max_new_tokens,
+        args.repetition_penalty, args.num_beams
     )
     print_summary(summary_s1)
     save_results(summary_s1, results_s1, args.output_dir, "stage1_projector")
