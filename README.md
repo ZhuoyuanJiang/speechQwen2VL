@@ -86,24 +86,53 @@ model = Qwen2VLForConditionalGeneration.from_pretrained(
 
 ## Setup
 
-### 1. Create conda environment
+There are two paths depending on how strictly you need to reproduce our env.
+
+### Path A — exact reproduction (recommended for evaluation / paper-style replication)
+
+Uses pinned conda manifest + a `pip freeze` lockfile + commit-pinned forks.
 
 ```bash
+# 1. Conda side (Python, CUDA, audio system libraries)
 conda env create -f environment.yml
 conda activate speech_qwen2vl
+
+# 2. Pip side — install the exact transitive versions that worked for us
+pip install -r requirements.lock.txt \
+    --extra-index-url https://download.pytorch.org/whl/cu121
+
+# 3. Forks — pinned to specific commit hashes inside the script
+bash scripts/setup_forks.sh
+```
+
+### Path B — development install (recommended if you'll be editing deps)
+
+Uses the human-curated top-level pins; lets pip resolve transitive versions.
+
+```bash
+conda env create -f environment.yml          # also runs `pip install -r requirements.txt`
+conda activate speech_qwen2vl
+bash scripts/setup_forks.sh
 ```
 
 If the pip install step fails (flash-attn build issue), see `Documentation/Session5_Progress_20260306.md` for the manual 3-stage install.
 
-### 2. Install forked libraries
+### What each environment file is for
+
+| File | Edited by | Pins | Use for |
+|---|---|---|---|
+| `environment.yml` | human | conda top-level (Python, CUDA, ffmpeg, libsndfile) | both paths — defines the conda env |
+| `requirements.txt` | human | pip top-level with `==` | Path B (and Path A pulls it via `environment.yml`) |
+| `requirements.lock.txt` | auto (`scripts/freeze_lockfile.py`) | every transitive pip dep at exact version | Path A (exact reproduction) |
+| `scripts/setup_forks.sh` | human | fork commit hashes (`TRANSFORMERS_COMMIT`, `QWEN_VL_COMMIT`) | both paths — installs the audio-modified forks |
+
+After installing or upgrading any pip package, regenerate the lockfile:
 
 ```bash
-bash scripts/setup_forks.sh
+python scripts/freeze_lockfile.py
 ```
 
-This installs our forked `transformers` (with audio support) and `qwen-vl-utils` in editable mode.
-
-### 3. Set up data directories
+### Set up data directories
 
 ```bash
 # On a server with local SSDs (recommended):
@@ -146,6 +175,29 @@ python scripts/evaluate.py --model both --n_samples 100 --gpu 0
 
 Or use `notebooks/07_evaluation.ipynb` for interactive analysis with plots and error inspection.
 
+## Live Demo
+
+![Live Demo screenshot](demo_image_20260505.png)
+
+A small Gradio app for trying the model interactively in a browser — record from your mic, upload a `.wav`, or pick from preloaded test-set examples.
+
+```bash
+# On the GPU server:
+conda activate speech_qwen2vl
+python scripts/serve.py --gpu 0
+# → loads stage2 + LoRA, opens http://127.0.0.1:7870
+
+# From a remote machine, tunnel the port:
+ssh -L 7870:localhost:7870 <server>
+# then open http://localhost:7870 in your local browser
+```
+
+The UI lets you:
+- Record audio with the browser mic, or upload an audio file
+- Switch between Stage 1 and Stage 2 (reloads the model — Stage 2 needs ~17 GB VRAM, fits on a 24 GB card)
+- Tune `repetition_penalty`, `num_beams`, `max_new_tokens` live
+- Replay a few preloaded test-set samples (regenerate them with `python scripts/extract_demo_samples.py`)
+
 ## Repository Structure
 
 ```
@@ -159,6 +211,9 @@ scripts/
   train_stage1.py       Multi-GPU DDP training (Stage 1)
   train_stage2.py       Multi-GPU DDP training (Stage 2)
   evaluate.py           CLI evaluation script
+  serve.py              Gradio demo backend (live transcription UI)
+  extract_demo_samples.py  Pull a few short test-set wavs for the demo
+  freeze_lockfile.py    Regenerate requirements.lock.txt from current env
   setup_forks.sh        Install forked transformers & qwen-vl-utils
 
 Documentation/
@@ -181,3 +236,9 @@ Key dependencies (see `requirements.txt` for full list):
 - PEFT 0.17.1
 - Flash Attention 2.6.3
 - jiwer (WER/CER evaluation)
+
+## Notes
+
+- `requirements.lock.txt` is a `pip freeze` snapshot, not hash-protected — `flash-attn` builds from source with no prebuilt wheels, so `pip-compile --generate-hashes` and `conda-lock` cannot fully lock this stack.
+- The HuggingFace model weights (`DanJZY/Qwen2-VL-7B-Speech` and the LoRA adapter) live on HF Hub — they are not in this repo.
+- `scripts/setup_forks.sh` pins forks to specific commit hashes (`git checkout --detach <SHA>`), so future pushes to the `speech-qwen2vl` branches will not silently change what gets installed.
