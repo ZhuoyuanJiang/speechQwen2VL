@@ -49,24 +49,27 @@ echo "=== Setting up forked packages in $FORKS_DIR ==="
 #   (torch 2.4.1, peft 0.17.1, trl 0.22.0.dev0).
 # Modified files on this branch:
 #   - src/transformers/models/qwen2_vl/processing_qwen2_vl.py (audio token expansion)
+#
+# REPRODUCIBILITY: We pin to a specific COMMIT, not just the branch, so future
+# pushes to speech-qwen2vl don't silently change what gets installed. To bump,
+# update TRANSFORMERS_COMMIT below and the corresponding line in README.md.
 TRANSFORMERS_REPO="https://github.com/ZhuoyuanJiang/transformers.git"
 TRANSFORMERS_BRANCH="speech-qwen2vl"
+TRANSFORMERS_COMMIT="934129b7701e7607facb39f286afc6bc4cc657df"
 
 if [ -d "$FORKS_DIR/transformers" ]; then
-    echo "transformers fork already cloned, pulling latest..."
+    echo "transformers fork already cloned, fetching..."
     cd "$FORKS_DIR/transformers"
     git fetch origin
-    git checkout "$TRANSFORMERS_BRANCH"
-    git pull origin "$TRANSFORMERS_BRANCH"
 else
     echo "Cloning transformers fork..."
     cd "$FORKS_DIR"
     git clone "$TRANSFORMERS_REPO"
     cd transformers
-    # Use plain checkout (no -b) so git's DWIM auto-tracks origin/speech-qwen2vl.
-    # With -b, git would create a new branch from HEAD (main) — wrong code.
-    git checkout "$TRANSFORMERS_BRANCH"
 fi
+# Detached-HEAD checkout to the pinned commit (reproducible).
+echo "Checking out transformers commit $TRANSFORMERS_COMMIT (branch tip: $TRANSFORMERS_BRANCH)"
+git checkout --detach "$TRANSFORMERS_COMMIT"
 
 echo "Installing transformers from fork (editable)..."
 pip install -e "$FORKS_DIR/transformers"
@@ -80,15 +83,16 @@ pip install -e "$FORKS_DIR/transformers"
 # Branch: speech-qwen2vl, created from QwenLM/Qwen3-VL commit 9658872
 # Modified files on this branch:
 #   - qwen-vl-utils/src/qwen_vl_utils/vision_process.py (fetch_audio, process_vision_info)
+#
+# REPRODUCIBILITY: pin to a specific COMMIT (see transformers section above).
 QWEN_VL_REPO="https://github.com/ZhuoyuanJiang/Qwen3-VL.git"
 QWEN_VL_BRANCH="speech-qwen2vl"
+QWEN_VL_COMMIT="56b0756a768cc3b01cba45b01c1bc3c8cb74ea3f"
 
 if [ -d "$FORKS_DIR/Qwen2-VL" ]; then
-    echo "qwen-vl-utils fork already cloned, pulling latest..."
+    echo "qwen-vl-utils fork already cloned, fetching..."
     cd "$FORKS_DIR/Qwen2-VL"
     git fetch origin
-    git checkout "$QWEN_VL_BRANCH"
-    git pull origin "$QWEN_VL_BRANCH"
 else
     echo "Cloning qwen-vl-utils fork..."
     cd "$FORKS_DIR"
@@ -98,10 +102,9 @@ else
     # since the code inside is still Qwen2-VL and we want our project references consistent.
     git clone "$QWEN_VL_REPO" Qwen2-VL
     cd Qwen2-VL
-    # Use plain checkout (no -b) so git's DWIM auto-tracks origin/speech-qwen2vl.
-    # With -b, git would create a new branch from HEAD (main) — wrong code.
-    git checkout "$QWEN_VL_BRANCH"
 fi
+echo "Checking out qwen-vl-utils commit $QWEN_VL_COMMIT (branch tip: $QWEN_VL_BRANCH)"
+git checkout --detach "$QWEN_VL_COMMIT"
 
 echo "Installing qwen-vl-utils from fork (editable)..."
 # The installable package (pyproject.toml) is in the qwen-vl-utils/ subdirectory,
