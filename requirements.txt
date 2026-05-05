@@ -38,6 +38,9 @@ soundfile==0.13.1
 # --- ASR evaluation (NEW for speech project) ---
 jiwer==4.0.0
 
+# --- Demo backend (Session 8) ---
+gradio==6.14.0
+
 # --- Experiment tracking ---
 wandb==0.21.1
 tensorboard==2.20.0
