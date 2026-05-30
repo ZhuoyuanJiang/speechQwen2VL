@@ -242,3 +242,16 @@ Key dependencies (see `requirements.txt` for full list):
 - `requirements.lock.txt` is a `pip freeze` snapshot, not hash-protected — `flash-attn` builds from source with no prebuilt wheels, so `pip-compile --generate-hashes` and `conda-lock` cannot fully lock this stack.
 - The HuggingFace model weights (`DanJZY/Qwen2-VL-7B-Speech` and the LoRA adapter) live on HF Hub — they are not in this repo.
 - `scripts/setup_forks.sh` pins forks to specific commit hashes (`git checkout --detach <SHA>`), so future pushes to the `speech-qwen2vl` branches will not silently change what gets installed.
+
+## Citation
+
+If you find this project useful, please consider citing it:
+
+```bibtex
+@software{jiang2026speechqwen2vl,
+  author = {Zhuoyuan Jiang},
+  title  = {speechQwen2VL: A Speech-Enabled Qwen2-VL-7B Foundation Model},
+  year   = {2026},
+  url    = {https://github.com/ZhuoyuanJiang/speechQwen2VL}
+}
+```
